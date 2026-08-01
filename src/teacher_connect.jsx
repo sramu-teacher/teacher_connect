@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
-import { Plus, X, Upload, Download, CloudUpload, CloudDownload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check } from "lucide-react";
-import { saveJsonToDrive, loadJsonFromDrive } from "./googleDrive";
+import { Plus, X, Upload, Download, CloudUpload, CloudDownload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag } from "lucide-react";
+import { saveJsonToDrive, loadJsonFromDrive, pickRosterFileFromDrive } from "./googleDrive";
 
 const DRIVE_FILENAME = "teacher_connect-seating-data.json";
 
@@ -23,9 +23,6 @@ const T = {
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
-// ---------- Sample seed (so the app never opens empty) ----------
-const SEED_STUDENTS = [];
-
 function emptyStudent(name = "") {
   return {
     id: uid(),
@@ -39,6 +36,32 @@ function emptyStudent(name = "") {
     academicLevel: "medium", // low, medium, high
     friends: [], // ids they work well with / want near
     avoid: [], // ids they must NOT sit near
+    observationLog: [], // [{id, date, text, flagged}]
+  };
+}
+
+// ---------- Periods ----------
+const PERIODS = ["Period 1", "Period 2", "Period 3", "Period 4", "Period 5", "Advisory"];
+
+function defaultPeriodState() {
+  return {
+    students: [],
+    layoutType: "grid", // grid | pods | pairs
+    rows: 4,
+    cols: 5,
+    numPods: 6,
+    perPod: 4,
+    numPairs: 10,
+    pairCols: 5,
+    options: {
+      balanceAcademic: true,
+      separateBehavior: true,
+      honorFriends: true,
+    },
+    assignment: {},
+    violations: [],
+    hasGenerated: false,
+    periodNotes: "",
   };
 }
 
@@ -51,16 +74,44 @@ function parseBulkNames(text) {
     .map((name) => emptyStudent(name));
 }
 
+// ---------- Parsing uploaded roster files (.csv / .txt) ----------
+function parseRosterFile(text, filename = "") {
+  const isCsv = filename.toLowerCase().endsWith(".csv") || text.includes(",");
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return [];
+
+  if (isCsv) {
+    const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
+    const nameIdx = header.findIndex((h) => h === "name" || h === "student" || h === "student name");
+    const firstIdx = header.findIndex((h) => h === "first" || h === "first name" || h === "firstname");
+    const lastIdx = header.findIndex((h) => h === "last" || h === "last name" || h === "lastname");
+    const hasHeader = nameIdx !== -1 || firstIdx !== -1 || lastIdx !== -1;
+    const dataLines = hasHeader ? lines.slice(1) : lines;
+
+    return dataLines
+      .map((line) => {
+        const cols = line.split(",").map((c) => c.trim());
+        let name = "";
+        if (hasHeader && nameIdx !== -1) {
+          name = cols[nameIdx] || "";
+        } else if (hasHeader && (firstIdx !== -1 || lastIdx !== -1)) {
+          name = [cols[firstIdx], cols[lastIdx]].filter(Boolean).join(" ");
+        } else {
+          name = cols.length >= 2 ? `${cols[1]} ${cols[0]}` : cols[0];
+        }
+        return name.trim();
+      })
+      .filter(Boolean)
+      .map((name) => emptyStudent(name));
+  }
+
+  return lines.map((name) => emptyStudent(name));
+}
+
 // ---------- Seating algorithm ----------
-// Greedy constraint-satisfaction with scoring: builds seat order from
-// grid geometry, then assigns students to minimize conflicts and
-// balance academic levels/behavior across groups, while respecting
-// hard "avoid" pairs as close to inviolable as geometry allows.
 function generateSeatingChart(students, seats, options) {
   const { balanceAcademic, separateBehavior, honorFriends } = options;
 
-  // adjacency: seats sharing a group/table/or being neighbors in grid
-  const seatById = Object.fromEntries(seats.map((s) => [s.id, s]));
   const neighborMap = {};
   seats.forEach((s) => (neighborMap[s.id] = []));
   seats.forEach((a) => {
@@ -84,13 +135,10 @@ function generateSeatingChart(students, seats, options) {
   });
 
   const studentsShuffled = [...students].sort(() => Math.random() - 0.5);
-
-  // Sort seats in a stable reading order for deterministic fill,
-  // but we'll actually assign via scoring, not just fill order.
   const seatOrder = [...seats].sort((a, b) => a.row - b.row || a.col - b.col);
 
-  const assignment = {}; // seatId -> studentId
-  const studentSeat = {}; // studentId -> seatId
+  const assignment = {};
+  const studentSeat = {};
   const placed = new Set();
 
   function conflictScore(studentId, seatId) {
@@ -103,14 +151,12 @@ function generateSeatingChart(students, seats, options) {
       const neighborStudent = students.find((s) => s.id === neighborStudentId);
       if (!neighborStudent) continue;
 
-      // Hard avoid violation — huge penalty
       if (
         student.avoid.includes(neighborStudentId) ||
         neighborStudent.avoid.includes(studentId)
       ) {
         score += 10000;
       }
-      // Friend bonus (small negative = good) if honoring friends
       if (
         honorFriends &&
         (student.friends.includes(neighborStudentId) ||
@@ -118,7 +164,6 @@ function generateSeatingChart(students, seats, options) {
       ) {
         score -= 5;
       }
-      // Behavior separation
       if (
         separateBehavior &&
         student.behaviorNotes &&
@@ -126,7 +171,6 @@ function generateSeatingChart(students, seats, options) {
       ) {
         score += 40;
       }
-      // Academic balance: discourage clustering same level together
       if (balanceAcademic && student.academicLevel === neighborStudent.academicLevel) {
         score += 8;
       }
@@ -134,7 +178,6 @@ function generateSeatingChart(students, seats, options) {
     return score;
   }
 
-  // Place EL / vision / hearing students first into front-of-room seats if flagged
   const priorityFront = studentsShuffled.filter(
     (s) => s.vision || s.hearing || (s.el && s.elLevel === "beginning")
   );
@@ -142,23 +185,18 @@ function generateSeatingChart(students, seats, options) {
   const restSeats = seatOrder.filter((s) => s.row > 1);
   const orderedSeatsForFront = [...frontSeats, ...restSeats];
 
-  const remainingStudents = studentsShuffled.filter(
-    (s) => !priorityFront.includes(s)
-  );
+  const remainingStudents = studentsShuffled.filter((s) => !priorityFront.includes(s));
   const fillQueue = [...priorityFront, ...remainingStudents];
 
   for (const student of fillQueue) {
     let bestSeat = null;
     let bestScore = Infinity;
     const candidateSeats =
-      priorityFront.includes(student) && !placed.has(student.id)
-        ? orderedSeatsForFront
-        : seatOrder;
+      priorityFront.includes(student) && !placed.has(student.id) ? orderedSeatsForFront : seatOrder;
 
     for (const seat of candidateSeats) {
       if (assignment[seat.id]) continue;
       const score = conflictScore(student.id, seat.id);
-      // slight randomization to avoid identical charts every click
       const jitter = Math.random() * 2;
       if (score + jitter < bestScore) {
         bestScore = score + jitter;
@@ -172,7 +210,6 @@ function generateSeatingChart(students, seats, options) {
     }
   }
 
-  // compute violated hard-avoid pairs for reporting
   const violations = [];
   for (const seat of seats) {
     const sid = assignment[seat.id];
@@ -212,13 +249,7 @@ function buildPods(numPods, perPod) {
     const podRow = Math.floor(p / cols);
     const podCol = p % cols;
     for (let i = 0; i < perPod; i++) {
-      seats.push({
-        id: `pod${p}s${i}`,
-        row: podRow,
-        col: podCol,
-        groupId: `pod${p}`,
-        seatIndexInGroup: i,
-      });
+      seats.push({ id: `pod${p}s${i}`, row: podRow, col: podCol, groupId: `pod${p}`, seatIndexInGroup: i });
     }
   }
   return seats;
@@ -237,24 +268,11 @@ function buildPairs(numPairs, cols) {
 
 // ---------- Main App ----------
 export default function SeatingChart() {
-  const [students, setStudents] = useState(SEED_STUDENTS);
-  const [layoutType, setLayoutType] = useState("grid"); // grid | pods | pairs
-  const [rows, setRows] = useState(4);
-  const [cols, setCols] = useState(5);
-  const [numPods, setNumPods] = useState(6);
-  const [perPod, setPerPod] = useState(4);
-  const [numPairs, setNumPairs] = useState(10);
-  const [pairCols, setPairCols] = useState(5);
-
-  const [options, setOptions] = useState({
-    balanceAcademic: true,
-    separateBehavior: true,
-    honorFriends: true,
-  });
-
-  const [assignment, setAssignment] = useState({});
-  const [violations, setViolations] = useState([]);
-  const [hasGenerated, setHasGenerated] = useState(false);
+  const [periods, setPeriods] = useState(() =>
+    Object.fromEntries(PERIODS.map((p) => [p, defaultPeriodState()]))
+  );
+  const [activePeriod, setActivePeriod] = useState(PERIODS[0]);
+  const period = periods[activePeriod];
 
   const [activeTab, setActiveTab] = useState("roster"); // roster | chart
   const [expandedStudentId, setExpandedStudentId] = useState(null);
@@ -262,62 +280,116 @@ export default function SeatingChart() {
   const [showBulk, setShowBulk] = useState(false);
   const [draggedStudent, setDraggedStudent] = useState(null);
   const [toast, setToast] = useState(null);
-  const fileInputRef = useRef(null);
+  const [rosterDragOver, setRosterDragOver] = useState(false);
+  const [driveLoading, setDriveLoading] = useState(false);
+  const [driveResult, setDriveResult] = useState(null);
   const [driveBusy, setDriveBusy] = useState(null); // "save" | "load" | null
+  const fileInputRef = useRef(null);
+  const rosterFileInputRef = useRef(null);
+
+  // Update the active period's slice immutably. Accepts an object patch or a fn(prevPeriod) => patch
+  const updatePeriod = useCallback(
+    (patch) => {
+      setPeriods((prev) => {
+        const prevPeriod = prev[activePeriod];
+        const resolved = typeof patch === "function" ? patch(prevPeriod) : patch;
+        return { ...prev, [activePeriod]: { ...prevPeriod, ...resolved } };
+      });
+    },
+    [activePeriod]
+  );
 
   const seats = useMemo(() => {
-    if (layoutType === "grid") return buildGrid(rows, cols);
-    if (layoutType === "pods") return buildPods(numPods, perPod);
-    if (layoutType === "pairs") return buildPairs(numPairs, pairCols);
+    if (period.layoutType === "grid") return buildGrid(period.rows, period.cols);
+    if (period.layoutType === "pods") return buildPods(period.numPods, period.perPod);
+    if (period.layoutType === "pairs") return buildPairs(period.numPairs, period.pairCols);
     return [];
-  }, [layoutType, rows, cols, numPods, perPod, numPairs, pairCols]);
+  }, [period.layoutType, period.rows, period.cols, period.numPods, period.perPod, period.numPairs, period.pairCols]);
 
   const showToast = useCallback((msg, tone = "sage") => {
     setToast({ msg, tone });
     setTimeout(() => setToast(null), 3200);
   }, []);
 
+  const switchPeriod = (p) => {
+    setActivePeriod(p);
+    setActiveTab("roster");
+    setExpandedStudentId(null);
+    setDriveResult(null);
+  };
+
   const addStudent = () => {
     const s = emptyStudent("");
-    setStudents((prev) => [...prev, s]);
+    updatePeriod((p) => ({ students: [...p.students, s] }));
     setExpandedStudentId(s.id);
     setActiveTab("roster");
   };
 
   const updateStudent = (id, patch) => {
-    setStudents((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+    updatePeriod((p) => ({
+      students: p.students.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+    }));
   };
 
   const removeStudent = (id) => {
-    setStudents((prev) =>
-      prev
+    updatePeriod((p) => ({
+      students: p.students
         .filter((s) => s.id !== id)
         .map((s) => ({
           ...s,
           friends: s.friends.filter((f) => f !== id),
           avoid: s.avoid.filter((a) => a !== id),
-        }))
-    );
-    setAssignment((prev) => {
-      const next = { ...prev };
+        })),
+    }));
+    updatePeriod((p) => {
+      const next = { ...p.assignment };
       Object.keys(next).forEach((seatId) => {
         if (next[seatId] === id) delete next[seatId];
       });
-      return next;
+      return { assignment: next };
     });
   };
 
   const toggleRelation = (id, otherId, field) => {
-    setStudents((prev) =>
-      prev.map((s) => {
+    updatePeriod((p) => ({
+      students: p.students.map((s) => {
         if (s.id !== id) return s;
         const has = s[field].includes(otherId);
         return {
           ...s,
           [field]: has ? s[field].filter((x) => x !== otherId) : [...s[field], otherId],
         };
-      })
-    );
+      }),
+    }));
+  };
+
+  const logObservation = (studentId, text, flagged) => {
+    if (!text.trim()) return;
+    const entry = {
+      id: uid(),
+      date: new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+      text: text.trim(),
+      flagged,
+    };
+    updatePeriod((p) => ({
+      students: p.students.map((s) => {
+        if (s.id !== studentId) return s;
+        const nextLog = [entry, ...s.observationLog];
+        const nextBehavior = flagged
+          ? (s.behaviorNotes ? `${s.behaviorNotes}\n[${entry.date}] ${entry.text}` : `[${entry.date}] ${entry.text}`)
+          : s.behaviorNotes;
+        return { ...s, observationLog: nextLog, behaviorNotes: nextBehavior };
+      }),
+    }));
+    showToast(flagged ? "Observation logged and flagged for seating." : "Observation logged.");
+  };
+
+  const removeObservation = (studentId, obsId) => {
+    updatePeriod((p) => ({
+      students: p.students.map((s) =>
+        s.id === studentId ? { ...s, observationLog: s.observationLog.filter((o) => o.id !== obsId) } : s
+      ),
+    }));
   };
 
   const handleBulkAdd = () => {
@@ -326,27 +398,76 @@ export default function SeatingChart() {
       showToast("No names found to add.", "clay");
       return;
     }
-    setStudents((prev) => [...prev, ...newStudents]);
+    updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
     setBulkText("");
     setShowBulk(false);
-    showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} to the roster.`);
+    showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} to ${activePeriod}.`);
+  };
+
+  const handleRosterFile = (file) => {
+    if (!file) return;
+    const lowerName = file.name.toLowerCase();
+    if (lowerName.endsWith(".pdf")) {
+      showToast(
+        "This app can't read PDFs directly. Paste the PDF into the chat with Claude instead — Claude will pull out the names for you.",
+        "clay"
+      );
+      return;
+    }
+    const isValidType = lowerName.endsWith(".csv") || lowerName.endsWith(".txt");
+    if (!isValidType) {
+      showToast("Please upload a .csv or .txt file of student names.", "clay");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const newStudents = parseRosterFile(evt.target.result, file.name);
+      if (newStudents.length === 0) {
+        showToast("Couldn't find any names in that file.", "clay");
+        return;
+      }
+      updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
+      showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} from ${file.name} to ${activePeriod}.`);
+    };
+    reader.readAsText(file);
+  };
+
+  // Opens Google's file picker so the teacher can choose a Sheet, Doc, CSV,
+  // or text roster from their own Drive; parsed the same way an uploaded
+  // file would be.
+  const handleDriveImport = async () => {
+    setDriveLoading(true);
+    setDriveResult(null);
+    try {
+      const picked = await pickRosterFileFromDrive();
+      if (!picked) return; // teacher cancelled the picker
+      const parsed = parseRosterFile(picked.text, picked.name);
+      if (parsed.length === 0) {
+        showToast(`Couldn't find any names in "${picked.name}".`, "clay");
+        return;
+      }
+      const existingNames = new Set(period.students.map((s) => s.name.trim().toLowerCase()));
+      const newStudents = parsed.filter((s) => !existingNames.has(s.name.toLowerCase()));
+      updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
+      setDriveResult({ fileName: picked.name, count: newStudents.length });
+      showToast(`Imported ${newStudents.length} student${newStudents.length !== 1 ? "s" : ""} from "${picked.name}" into ${activePeriod}.`);
+    } catch (err) {
+      showToast(err.message || "Couldn't import from Drive — try again.", "clay");
+    } finally {
+      setDriveLoading(false);
+    }
   };
 
   const handleGenerate = () => {
-    if (students.length === 0) {
+    if (period.students.length === 0) {
       showToast("Add students to the roster first.", "clay");
       return;
     }
-    if (seats.length < students.length) {
-      showToast(
-        `Only ${seats.length} seats for ${students.length} students — add more seats.`,
-        "clay"
-      );
+    if (seats.length < period.students.length) {
+      showToast(`Only ${seats.length} seats for ${period.students.length} students — add more seats.`, "clay");
     }
-    const result = generateSeatingChart(students, seats, options);
-    setAssignment(result.assignment);
-    setViolations(result.violations);
-    setHasGenerated(true);
+    const result = generateSeatingChart(period.students, seats, period.options);
+    updatePeriod({ assignment: result.assignment, violations: result.violations, hasGenerated: true });
     setActiveTab("chart");
     if (result.violations.length === 0) {
       showToast("Seating chart generated — no avoid-pairs seated together.");
@@ -358,20 +479,15 @@ export default function SeatingChart() {
     }
   };
 
-  const buildExportData = () => ({
-    students, layoutType, rows, cols, numPods, perPod, numPairs, pairCols, assignment,
-  });
+  const buildExportData = () => ({ periods, activePeriod, savedAt: new Date().toISOString() });
 
   const applyImportedData = (data) => {
-    if (data.students) setStudents(data.students);
-    if (data.layoutType) setLayoutType(data.layoutType);
-    if (data.rows) setRows(data.rows);
-    if (data.cols) setCols(data.cols);
-    if (data.numPods) setNumPods(data.numPods);
-    if (data.perPod) setPerPod(data.perPod);
-    if (data.numPairs) setNumPairs(data.numPairs);
-    if (data.pairCols) setPairCols(data.pairCols);
-    if (data.assignment) setAssignment(data.assignment);
+    if (data.periods) {
+      // ensure every expected period key exists, migrate missing ones
+      const merged = Object.fromEntries(PERIODS.map((p) => [p, data.periods[p] || defaultPeriodState()]));
+      setPeriods(merged);
+    }
+    if (data.activePeriod && PERIODS.includes(data.activePeriod)) setActivePeriod(data.activePeriod);
   };
 
   const handleExport = () => {
@@ -391,7 +507,7 @@ export default function SeatingChart() {
     reader.onload = (evt) => {
       try {
         applyImportedData(JSON.parse(evt.target.result));
-        showToast("Roster and chart loaded from file.");
+        showToast("Document loaded — all periods restored.");
       } catch {
         showToast("Couldn't read that file — expecting a JSON export from this app.", "clay");
       }
@@ -403,7 +519,7 @@ export default function SeatingChart() {
     setDriveBusy("save");
     try {
       await saveJsonToDrive(DRIVE_FILENAME, buildExportData());
-      showToast("Roster and chart saved to Google Drive.");
+      showToast("All periods saved to Google Drive.");
     } catch (err) {
       showToast(err.message || "Couldn't save to Google Drive.", "clay");
     } finally {
@@ -417,7 +533,7 @@ export default function SeatingChart() {
       const data = await loadJsonFromDrive();
       if (data) {
         applyImportedData(data);
-        showToast("Roster and chart loaded from Google Drive.");
+        showToast("Document loaded from Google Drive.");
       }
     } catch (err) {
       showToast(err.message || "Couldn't load from Google Drive.", "clay");
@@ -426,36 +542,29 @@ export default function SeatingChart() {
     }
   };
 
-  // manual drag-to-swap on chart
   const handleDrop = (seatId) => {
     if (!draggedStudent) return;
-    setAssignment((prev) => {
-      const next = { ...prev };
+    updatePeriod((p) => {
+      const next = { ...p.assignment };
       const fromSeat = Object.keys(next).find((sid) => next[sid] === draggedStudent);
       const displaced = next[seatId];
       if (fromSeat) next[fromSeat] = displaced || undefined;
       if (!displaced && fromSeat) delete next[fromSeat];
       next[seatId] = draggedStudent;
-      if (!fromSeat) {
-        // came from unseated
-      }
-      return next;
+      return { assignment: next };
     });
     setDraggedStudent(null);
   };
 
-  const unseated = students.filter(
-    (s) => !Object.values(assignment).includes(s.id)
-  );
-
-  const studentById = Object.fromEntries(students.map((s) => [s.id, s]));
+  const unseated = period.students.filter((s) => !Object.values(period.assignment).includes(s.id));
+  const studentById = Object.fromEntries(period.students.map((s) => [s.id, s]));
 
   const flagCounts = {
-    iep: students.filter((s) => s.iep.trim()).length,
-    el: students.filter((s) => s.el).length,
-    behavior: students.filter((s) => s.behaviorNotes.trim()).length,
-    vision: students.filter((s) => s.vision).length,
-    hearing: students.filter((s) => s.hearing).length,
+    iep: period.students.filter((s) => s.iep.trim()).length,
+    el: period.students.filter((s) => s.el).length,
+    behavior: period.students.filter((s) => s.behaviorNotes.trim()).length,
+    vision: period.students.filter((s) => s.vision).length,
+    hearing: period.students.filter((s) => s.hearing).length,
   };
 
   return (
@@ -470,12 +579,12 @@ export default function SeatingChart() {
         input, textarea, select { font-family: 'Inter', system-ui, sans-serif; }
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-thumb { background: ${T.line}; border-radius: 4px; }
-        .seat {
-          transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
-        }
+        .seat { transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease; }
         .seat:hover { transform: translateY(-2px); }
         .fade-in { animation: fadeIn 0.35s ease; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+        .spin { animation: spin 0.8s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .tab-underline { position: relative; }
         .tab-underline::after {
           content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
@@ -491,7 +600,7 @@ export default function SeatingChart() {
 
       {/* ---------- Header ---------- */}
       <header style={{ borderBottom: `1px solid ${T.line}`, background: T.paper, position: "sticky", top: 0, zIndex: 20 }}>
-        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "20px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "20px 24px 0", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
           <div>
             <div className="sans" style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", color: T.brass, fontWeight: 600, marginBottom: 2 }}>
               Roster &amp; Room
@@ -500,11 +609,18 @@ export default function SeatingChart() {
               Seating Intelligence
             </h1>
           </div>
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <button onClick={() => fileInputRef.current?.click()} className="sans" style={btnGhost}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <label htmlFor="load-json-input" className="sans" style={{ ...btnGhost, margin: 0 }}>
               <Upload size={15} /> Load
-            </button>
-            <input ref={fileInputRef} type="file" accept="application/json" onChange={handleImport} style={{ display: "none" }} />
+            </label>
+            <input
+              id="load-json-input"
+              ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              onChange={handleImport}
+              style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+            />
             <button onClick={handleExport} className="sans" style={btnGhost}>
               <Download size={15} /> Save
             </button>
@@ -527,10 +643,51 @@ export default function SeatingChart() {
           </div>
         </div>
 
-        {/* Tabs */}
-        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "0 24px", display: "flex", gap: 28 }}>
+        {/* Period tabs */}
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "16px 24px 0", display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {PERIODS.map((p) => {
+            const active = p === activePeriod;
+            const count = periods[p].students.length;
+            return (
+              <button
+                key={p}
+                onClick={() => switchPeriod(p)}
+                className="sans"
+                style={{
+                  padding: "7px 14px",
+                  borderRadius: 20,
+                  fontSize: 12.5,
+                  fontWeight: 700,
+                  border: `1px solid ${active ? T.ink : T.line}`,
+                  background: active ? T.ink : "transparent",
+                  color: active ? T.paper : T.graphite,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                {p}
+                {count > 0 && (
+                  <span
+                    style={{
+                      fontSize: 10.5,
+                      fontWeight: 700,
+                      color: active ? T.paper : T.brass,
+                      opacity: active ? 0.85 : 1,
+                    }}
+                  >
+                    {count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Roster / Chart tabs */}
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "10px 24px 0", display: "flex", gap: 28 }}>
           {[
-            { id: "roster", label: `Roster (${students.length})` },
+            { id: "roster", label: `Roster (${period.students.length})` },
             { id: "chart", label: "Seating Chart" },
           ].map((t) => (
             <button
@@ -555,11 +712,16 @@ export default function SeatingChart() {
       <main style={{ maxWidth: 1180, margin: "0 auto", padding: "28px 24px 80px" }}>
         {activeTab === "roster" && (
           <RosterView
-            students={students}
+            activePeriod={activePeriod}
+            students={period.students}
+            periodNotes={period.periodNotes}
+            setPeriodNotes={(text) => updatePeriod({ periodNotes: text })}
             addStudent={addStudent}
             updateStudent={updateStudent}
             removeStudent={removeStudent}
             toggleRelation={toggleRelation}
+            logObservation={logObservation}
+            removeObservation={removeObservation}
             expandedStudentId={expandedStudentId}
             setExpandedStudentId={setExpandedStudentId}
             bulkText={bulkText}
@@ -568,32 +730,43 @@ export default function SeatingChart() {
             setShowBulk={setShowBulk}
             handleBulkAdd={handleBulkAdd}
             flagCounts={flagCounts}
+            handleRosterFile={handleRosterFile}
+            rosterFileInputRef={rosterFileInputRef}
+            rosterDragOver={rosterDragOver}
+            setRosterDragOver={setRosterDragOver}
+            driveLoading={driveLoading}
+            driveResult={driveResult}
+            handleDriveImport={handleDriveImport}
           />
         )}
 
         {activeTab === "chart" && (
           <ChartView
-            students={students}
-            layoutType={layoutType}
-            setLayoutType={setLayoutType}
-            rows={rows}
-            setRows={setRows}
-            cols={cols}
-            setCols={setCols}
-            numPods={numPods}
-            setNumPods={setNumPods}
-            perPod={perPod}
-            setPerPod={setPerPod}
-            numPairs={numPairs}
-            setNumPairs={setNumPairs}
-            pairCols={pairCols}
-            setPairCols={setPairCols}
-            options={options}
-            setOptions={setOptions}
+            students={period.students}
+            layoutType={period.layoutType}
+            setLayoutType={(v) => updatePeriod({ layoutType: v })}
+            rows={period.rows}
+            setRows={(v) => updatePeriod({ rows: v })}
+            cols={period.cols}
+            setCols={(v) => updatePeriod({ cols: v })}
+            numPods={period.numPods}
+            setNumPods={(v) => updatePeriod({ numPods: v })}
+            perPod={period.perPod}
+            setPerPod={(v) => updatePeriod({ perPod: v })}
+            numPairs={period.numPairs}
+            setNumPairs={(v) => updatePeriod({ numPairs: v })}
+            pairCols={period.pairCols}
+            setPairCols={(v) => updatePeriod({ pairCols: v })}
+            options={period.options}
+            setOptions={(fnOrObj) =>
+              updatePeriod((p) => ({
+                options: typeof fnOrObj === "function" ? fnOrObj(p.options) : fnOrObj,
+              }))
+            }
             seats={seats}
-            assignment={assignment}
-            violations={violations}
-            hasGenerated={hasGenerated}
+            assignment={period.assignment}
+            violations={period.violations}
+            hasGenerated={period.hasGenerated}
             handleGenerate={handleGenerate}
             studentById={studentById}
             unseated={unseated}
@@ -659,11 +832,16 @@ const btnPrimary = {
 
 // ================= Roster View =================
 function RosterView({
+  activePeriod,
   students,
+  periodNotes,
+  setPeriodNotes,
   addStudent,
   updateStudent,
   removeStudent,
   toggleRelation,
+  logObservation,
+  removeObservation,
   expandedStudentId,
   setExpandedStudentId,
   bulkText,
@@ -672,9 +850,30 @@ function RosterView({
   setShowBulk,
   handleBulkAdd,
   flagCounts,
+  handleRosterFile,
+  rosterFileInputRef,
+  rosterDragOver,
+  setRosterDragOver,
+  driveLoading,
+  driveResult,
+  handleDriveImport,
 }) {
   return (
     <div className="fade-in">
+      {/* Period notes */}
+      <div style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: "12px 16px", background: T.paperDim, marginBottom: 18 }}>
+        <div className="sans" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, fontWeight: 700, color: "#6B6455", marginBottom: 6, letterSpacing: "0.03em" }}>
+          <StickyNote size={13} color={T.brass} /> {activePeriod.toUpperCase()} NOTES
+        </div>
+        <textarea
+          value={periodNotes}
+          onChange={(e) => setPeriodNotes(e.target.value)}
+          placeholder="General notes about this class — pacing, group dynamics, what worked last time..."
+          className="sans"
+          style={{ ...inputStyle, minHeight: 44, resize: "vertical", border: "none", background: "transparent", padding: "2px 0" }}
+        />
+      </div>
+
       {/* Summary strip */}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 22 }}>
         <SummaryChip icon={<FileText size={13} />} label="IEP" count={flagCounts.iep} />
@@ -684,19 +883,100 @@ function RosterView({
         <SummaryChip icon={<Ear size={13} />} label="Hearing" count={flagCounts.hearing} />
       </div>
 
+      {/* Upload zone — drop a CSV/TXT roster, or click to browse via native label-for-input */}
+      <label
+        htmlFor="roster-file-input"
+        onDragOver={(e) => {
+          e.preventDefault();
+          setRosterDragOver(true);
+        }}
+        onDragLeave={() => setRosterDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setRosterDragOver(false);
+          const file = e.dataTransfer.files?.[0];
+          handleRosterFile(file);
+        }}
+        className="sans"
+        style={{
+          display: "block",
+          border: `1.5px dashed ${rosterDragOver ? T.brass : T.line}`,
+          borderRadius: 12,
+          padding: "28px 20px",
+          textAlign: "center",
+          background: rosterDragOver ? T.brassSoft : T.paperDim,
+          cursor: "pointer",
+          marginBottom: 6,
+          transition: "background 0.15s ease, border-color 0.15s ease",
+        }}
+      >
+        <Upload size={22} color={T.brass} style={{ marginBottom: 8 }} />
+        <div style={{ fontSize: 14.5, fontWeight: 700, color: T.ink, marginBottom: 3 }}>
+          Upload {activePeriod}'s roster
+        </div>
+        <div style={{ fontSize: 12.5, color: "#8A8272" }}>
+          Drop a .csv or .txt file here, or click to browse — one student per row
+          <br />
+          Have a PDF roster instead? Paste it into the chat with Claude and it'll extract the names for you.
+        </div>
+        <input
+          id="roster-file-input"
+          ref={rosterFileInputRef}
+          type="file"
+          accept=".csv,.txt,text/csv,text/plain"
+          onChange={(e) => {
+            handleRosterFile(e.target.files?.[0]);
+            e.target.value = "";
+          }}
+          style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+        />
+      </label>
+      <div className="sans" style={{ fontSize: 11.5, color: "#A89F8C", marginBottom: 18, textAlign: "center" }}>
+        If the file dialog doesn't open on click, use "Paste names instead" below — it always works.
+      </div>
+
+      {/* Google Drive import */}
+      <div style={{ border: `1px solid ${T.line}`, borderRadius: 12, padding: "16px 18px", background: T.paperDim, marginBottom: 18 }}>
+        <div className="sans" style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13, fontWeight: 700, color: T.ink, marginBottom: 10 }}>
+          <Cloud size={16} color={T.brass} /> Import from Google Drive
+        </div>
+        <button
+          onClick={handleDriveImport}
+          disabled={driveLoading}
+          className="sans"
+          style={{
+            ...btnGhost,
+            background: driveLoading ? T.paperDim : T.paper,
+            opacity: driveLoading ? 0.7 : 1,
+            whiteSpace: "nowrap",
+          }}
+        >
+          {driveLoading ? <Loader2 size={14} className="spin" /> : <Cloud size={14} />}
+          {driveLoading ? "Opening Drive…" : "Choose a roster file from Drive"}
+        </button>
+        <div className="sans" style={{ fontSize: 11.5, color: "#A89F8C", marginTop: 8 }}>
+          Opens Google's file picker so you can select a Sheet, Doc, CSV, or text roster from your Drive — names are pulled in the same way as an uploaded file, into {activePeriod}.
+        </div>
+        {driveResult && (
+          <div className="sans fade-in" style={{ fontSize: 12, color: T.sage, marginTop: 8, fontWeight: 600 }}>
+            Imported {driveResult.count} student{driveResult.count !== 1 ? "s" : ""} from "{driveResult.fileName}".
+          </div>
+        )}
+      </div>
+
       <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
         <button onClick={addStudent} className="sans" style={btnPrimary}>
           <Plus size={16} /> Add student
         </button>
         <button onClick={() => setShowBulk((v) => !v)} className="sans" style={btnGhost}>
-          <Users size={15} /> Bulk add by name
+          <Users size={15} /> Paste names instead
         </button>
       </div>
 
       {showBulk && (
         <div className="fade-in" style={{ marginBottom: 22, background: T.paperDim, border: `1px solid ${T.line}`, borderRadius: 10, padding: 16 }}>
           <div className="sans" style={{ fontSize: 12.5, color: "#6B6455", marginBottom: 8 }}>
-            Paste one name per line (or comma-separated). You can fill in IEP, EL, and pairing details after.
+            Paste one name per line (or comma-separated) into {activePeriod}. You can fill in IEP, EL, and pairing details after.
           </div>
           <textarea
             value={bulkText}
@@ -727,7 +1007,7 @@ function RosterView({
       )}
 
       {students.length === 0 ? (
-        <EmptyRoster addStudent={addStudent} setShowBulk={setShowBulk} />
+        <EmptyRoster addStudent={addStudent} setShowBulk={setShowBulk} activePeriod={activePeriod} />
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {students.map((s) => (
@@ -738,6 +1018,8 @@ function RosterView({
               updateStudent={updateStudent}
               removeStudent={removeStudent}
               toggleRelation={toggleRelation}
+              logObservation={logObservation}
+              removeObservation={removeObservation}
               expanded={expandedStudentId === s.id}
               setExpanded={() => setExpandedStudentId(expandedStudentId === s.id ? null : s.id)}
             />
@@ -748,20 +1030,12 @@ function RosterView({
   );
 }
 
-function EmptyRoster({ addStudent, setShowBulk }) {
+function EmptyRoster({ addStudent, setShowBulk, activePeriod }) {
   return (
-    <div
-      style={{
-        border: `1.5px dashed ${T.line}`,
-        borderRadius: 12,
-        padding: "56px 24px",
-        textAlign: "center",
-        background: T.paperDim,
-      }}
-    >
+    <div style={{ border: `1.5px dashed ${T.line}`, borderRadius: 12, padding: "56px 24px", textAlign: "center", background: T.paperDim }}>
       <Grid3x3 size={28} color={T.brass} style={{ marginBottom: 12 }} />
       <div className="serif" style={{ fontSize: 19, fontWeight: 600, marginBottom: 6 }}>
-        No students on the roster yet
+        No students in {activePeriod} yet
       </div>
       <div className="sans" style={{ fontSize: 13.5, color: "#8A8272", marginBottom: 18, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
         Add students one at a time with full details, or paste a class list to get everyone in fast.
@@ -802,8 +1076,11 @@ function SummaryChip({ icon, label, count }) {
   );
 }
 
-function StudentCard({ student, allStudents, updateStudent, removeStudent, toggleRelation, expanded, setExpanded }) {
+function StudentCard({ student, allStudents, updateStudent, removeStudent, toggleRelation, logObservation, removeObservation, expanded, setExpanded }) {
   const others = allStudents.filter((s) => s.id !== student.id);
+  const [obsText, setObsText] = useState("");
+  const [obsFlag, setObsFlag] = useState(false);
+
   const flags = [];
   if (student.iep.trim()) flags.push({ icon: <FileText size={11} />, label: "IEP" });
   if (student.el) flags.push({ icon: <Languages size={11} />, label: student.elLevel ? `EL · ${student.elLevel}` : "EL" });
@@ -811,64 +1088,43 @@ function StudentCard({ student, allStudents, updateStudent, removeStudent, toggl
   if (student.vision) flags.push({ icon: <Eye size={11} />, label: "Vision" });
   if (student.hearing) flags.push({ icon: <Ear size={11} />, label: "Hearing" });
 
+  const submitObservation = () => {
+    if (!obsText.trim()) return;
+    logObservation(student.id, obsText, obsFlag);
+    setObsText("");
+    setObsFlag(false);
+  };
+
   return (
     <div style={{ border: `1px solid ${T.line}`, borderRadius: 10, background: T.paper, overflow: "hidden" }}>
-      <div
-        onClick={setExpanded}
-        style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 16px", cursor: "pointer" }}
-      >
+      <div onClick={setExpanded} style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 16px", cursor: "pointer" }}>
         <input
           value={student.name}
           onChange={(e) => updateStudent(student.id, { name: e.target.value })}
           onClick={(e) => e.stopPropagation()}
           placeholder="Student name"
           className="sans"
-          style={{
-            border: "none",
-            outline: "none",
-            background: "transparent",
-            fontSize: 15,
-            fontWeight: 600,
-            color: T.ink,
-            flex: "0 1 220px",
-            minWidth: 140,
-          }}
+          style={{ border: "none", outline: "none", background: "transparent", fontSize: 15, fontWeight: 600, color: T.ink, flex: "0 1 220px", minWidth: 140 }}
         />
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", flex: 1 }}>
           {flags.map((f, i) => (
             <span
               key={i}
               className="sans chip"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                background: T.brassSoft,
-                color: "#7A5A18",
-                borderRadius: 12,
-                padding: "3px 9px",
-                fontSize: 11,
-                fontWeight: 600,
-              }}
+              style={{ display: "flex", alignItems: "center", gap: 4, background: T.brassSoft, color: "#7A5A18", borderRadius: 12, padding: "3px 9px", fontSize: 11, fontWeight: 600 }}
             >
               {f.icon}
               {f.label}
             </span>
           ))}
           {student.academicLevel && (
-            <span
-              className="sans"
-              style={{
-                background: T.paperDim,
-                color: "#8A8272",
-                borderRadius: 12,
-                padding: "3px 9px",
-                fontSize: 11,
-                fontWeight: 600,
-                textTransform: "capitalize",
-              }}
-            >
+            <span className="sans" style={{ background: T.paperDim, color: "#8A8272", borderRadius: 12, padding: "3px 9px", fontSize: 11, fontWeight: 600, textTransform: "capitalize" }}>
               {student.academicLevel} level
+            </span>
+          )}
+          {student.observationLog.length > 0 && (
+            <span className="sans" style={{ display: "flex", alignItems: "center", gap: 4, background: T.sageSoft, color: T.sage, borderRadius: 12, padding: "3px 9px", fontSize: 11, fontWeight: 600 }}>
+              <StickyNote size={11} /> {student.observationLog.length}
             </span>
           )}
         </div>
@@ -889,11 +1145,7 @@ function StudentCard({ student, allStudents, updateStudent, removeStudent, toggl
         <div className="fade-in sans" style={{ padding: "4px 16px 20px", borderTop: `1px solid ${T.line}` }}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
             <Field label="Academic level">
-              <select
-                value={student.academicLevel}
-                onChange={(e) => updateStudent(student.id, { academicLevel: e.target.value })}
-                style={inputStyle}
-              >
+              <select value={student.academicLevel} onChange={(e) => updateStudent(student.id, { academicLevel: e.target.value })} style={inputStyle}>
                 <option value="low">Needs support</option>
                 <option value="medium">On level</option>
                 <option value="high">Advanced</option>
@@ -907,11 +1159,7 @@ function StudentCard({ student, allStudents, updateStudent, removeStudent, toggl
                   EL student
                 </label>
                 {student.el && (
-                  <select
-                    value={student.elLevel}
-                    onChange={(e) => updateStudent(student.id, { elLevel: e.target.value })}
-                    style={{ ...inputStyle, flex: 1 }}
-                  >
+                  <select value={student.elLevel} onChange={(e) => updateStudent(student.id, { elLevel: e.target.value })} style={{ ...inputStyle, flex: 1 }}>
                     <option value="">Proficiency level</option>
                     <option value="beginning">Beginning</option>
                     <option value="intermediate">Intermediate</option>
@@ -930,7 +1178,7 @@ function StudentCard({ student, allStudents, updateStudent, removeStudent, toggl
               />
             </Field>
 
-            <Field label="Behavior notes" full>
+            <Field label="Behavior notes" full hint="also updated automatically by flagged observations below">
               <textarea
                 value={student.behaviorNotes}
                 onChange={(e) => updateStudent(student.id, { behaviorNotes: e.target.value })}
@@ -956,25 +1204,63 @@ function StudentCard({ student, allStudents, updateStudent, removeStudent, toggl
           {others.length > 0 && (
             <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
               <Field label="Pairs well with" hint="friend / positive-working pairing">
-                <RelationPicker
-                  student={student}
-                  others={others}
-                  field="friends"
-                  toggleRelation={toggleRelation}
-                  tone="sage"
-                />
+                <RelationPicker student={student} others={others} field="friends" toggleRelation={toggleRelation} tone="sage" />
               </Field>
               <Field label="Must not sit near" hint="known conflict — treated as a hard rule">
-                <RelationPicker
-                  student={student}
-                  others={others}
-                  field="avoid"
-                  toggleRelation={toggleRelation}
-                  tone="clay"
-                />
+                <RelationPicker student={student} others={others} field="avoid" toggleRelation={toggleRelation} tone="clay" />
               </Field>
             </div>
           )}
+
+          {/* Quick observations */}
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: "#6B6455", marginBottom: 8, letterSpacing: "0.02em", display: "flex", alignItems: "center", gap: 5 }}>
+              <StickyNote size={12} color={T.brass} /> QUICK OBSERVATIONS
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <input
+                value={obsText}
+                onChange={(e) => setObsText(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitObservation()}
+                placeholder="e.g., distracted next to Ethan today — moved seats"
+                style={{ ...inputStyle, flex: 1, minWidth: 180 }}
+              />
+              <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: T.clay, whiteSpace: "nowrap" }}>
+                <input type="checkbox" checked={obsFlag} onChange={(e) => setObsFlag(e.target.checked)} />
+                <Flag size={11} /> Flag for seating
+              </label>
+              <button onClick={submitObservation} className="sans" style={{ ...btnGhost, padding: "7px 12px" }}>
+                Log
+              </button>
+            </div>
+
+            {student.observationLog.length > 0 && (
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6, maxHeight: 140, overflowY: "auto" }}>
+                {student.observationLog.map((o) => (
+                  <div
+                    key={o.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 8,
+                      fontSize: 12.5,
+                      color: T.graphite,
+                      background: o.flagged ? T.claySoft : T.paperDim,
+                      borderRadius: 7,
+                      padding: "6px 10px",
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, color: "#8A8272", flexShrink: 0 }}>{o.date}</span>
+                    <span style={{ flex: 1 }}>{o.text}</span>
+                    {o.flagged && <Flag size={11} color={T.clay} style={{ flexShrink: 0, marginTop: 2 }} />}
+                    <button onClick={() => removeObservation(student.id, o.id)} style={{ background: "none", border: "none", color: "#B0A890", padding: 0, flexShrink: 0 }}>
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -1132,21 +1418,9 @@ function ChartView({
             PRIORITIES
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-            <ToggleRow
-              label="Balance academic levels within groups"
-              checked={options.balanceAcademic}
-              onChange={(v) => setOptions((o) => ({ ...o, balanceAcademic: v }))}
-            />
-            <ToggleRow
-              label="Separate students with behavior notes"
-              checked={options.separateBehavior}
-              onChange={(v) => setOptions((o) => ({ ...o, separateBehavior: v }))}
-            />
-            <ToggleRow
-              label="Honor positive pairings when possible"
-              checked={options.honorFriends}
-              onChange={(v) => setOptions((o) => ({ ...o, honorFriends: v }))}
-            />
+            <ToggleRow label="Balance academic levels within groups" checked={options.balanceAcademic} onChange={(v) => setOptions((o) => ({ ...o, balanceAcademic: v }))} />
+            <ToggleRow label="Separate students with behavior notes" checked={options.separateBehavior} onChange={(v) => setOptions((o) => ({ ...o, separateBehavior: v }))} />
+            <ToggleRow label="Honor positive pairings when possible" checked={options.honorFriends} onChange={(v) => setOptions((o) => ({ ...o, honorFriends: v }))} />
           </div>
           <button onClick={handleGenerate} className="sans" style={{ ...btnPrimary, marginTop: 16, width: "100%", justifyContent: "center", background: T.brass }}>
             <Wand2 size={16} /> {hasGenerated ? "Regenerate chart" : "Generate seating chart"}
@@ -1157,23 +1431,11 @@ function ChartView({
       {violations.length > 0 && (
         <div
           className="sans fade-in"
-          style={{
-            display: "flex",
-            gap: 10,
-            alignItems: "flex-start",
-            background: T.claySoft,
-            border: `1px solid ${T.clay}55`,
-            borderRadius: 9,
-            padding: "12px 16px",
-            marginBottom: 18,
-            fontSize: 13,
-            color: "#7A3323",
-          }}
+          style={{ display: "flex", gap: 10, alignItems: "flex-start", background: T.claySoft, border: `1px solid ${T.clay}55`, borderRadius: 9, padding: "12px 16px", marginBottom: 18, fontSize: 13, color: "#7A3323" }}
         >
           <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
           <div>
-            <strong>{violations.length} pairing{violations.length > 1 ? "s" : ""} couldn't be fully separated</strong> given the room size —
-            {" "}
+            <strong>{violations.length} pairing{violations.length > 1 ? "s" : ""} couldn't be fully separated</strong> given the room size —{" "}
             {violations.map((v, i) => (
               <span key={v.key}>
                 {v.a} &amp; {v.b}
@@ -1186,15 +1448,7 @@ function ChartView({
       )}
 
       {hasGenerated ? (
-        <SeatGrid
-          layoutType={layoutType}
-          seats={seats}
-          assignment={assignment}
-          studentById={studentById}
-          draggedStudent={draggedStudent}
-          setDraggedStudent={setDraggedStudent}
-          handleDrop={handleDrop}
-        />
+        <SeatGrid layoutType={layoutType} seats={seats} assignment={assignment} studentById={studentById} draggedStudent={draggedStudent} setDraggedStudent={setDraggedStudent} handleDrop={handleDrop} />
       ) : (
         <div style={{ border: `1.5px dashed ${T.line}`, borderRadius: 12, padding: "56px 24px", textAlign: "center", background: T.paperDim }}>
           <Wand2 size={26} color={T.brass} style={{ marginBottom: 10 }} />
@@ -1266,14 +1520,7 @@ function SeatGrid({ layoutType, seats, assignment, studentById, draggedStudent, 
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
               {groupSeats.map((seat) => (
-                <SeatCell
-                  key={seat.id}
-                  seat={seat}
-                  student={assignment[seat.id] ? studentById[assignment[seat.id]] : null}
-                  draggedStudent={draggedStudent}
-                  setDraggedStudent={setDraggedStudent}
-                  handleDrop={handleDrop}
-                />
+                <SeatCell key={seat.id} seat={seat} student={assignment[seat.id] ? studentById[assignment[seat.id]] : null} draggedStudent={draggedStudent} setDraggedStudent={setDraggedStudent} handleDrop={handleDrop} />
               ))}
             </div>
           </div>
@@ -1293,15 +1540,7 @@ function SeatGrid({ layoutType, seats, assignment, studentById, draggedStudent, 
         {Object.entries(groups).map(([groupId, groupSeats]) => (
           <div key={groupId} style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: 10, background: T.paperDim, display: "flex", gap: 8 }}>
             {groupSeats.map((seat) => (
-              <SeatCell
-                key={seat.id}
-                seat={seat}
-                student={assignment[seat.id] ? studentById[assignment[seat.id]] : null}
-                draggedStudent={draggedStudent}
-                setDraggedStudent={setDraggedStudent}
-                handleDrop={handleDrop}
-                wide
-              />
+              <SeatCell key={seat.id} seat={seat} student={assignment[seat.id] ? studentById[assignment[seat.id]] : null} draggedStudent={draggedStudent} setDraggedStudent={setDraggedStudent} handleDrop={handleDrop} wide />
             ))}
           </div>
         ))}
@@ -1309,23 +1548,11 @@ function SeatGrid({ layoutType, seats, assignment, studentById, draggedStudent, 
     );
   }
 
-  // grid layout
   const maxRow = Math.max(...seats.map((s) => s.row), 0);
   const maxCol = Math.max(...seats.map((s) => s.col), 0);
   return (
     <div>
-      <div
-        className="sans"
-        style={{
-          textAlign: "center",
-          fontSize: 11,
-          fontWeight: 700,
-          letterSpacing: "0.12em",
-          color: "#A89F8C",
-          marginBottom: 14,
-          textTransform: "uppercase",
-        }}
-      >
+      <div className="sans" style={{ textAlign: "center", fontSize: 11, fontWeight: 700, letterSpacing: "0.12em", color: "#A89F8C", marginBottom: 14, textTransform: "uppercase" }}>
         Front of room
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
@@ -1335,14 +1562,7 @@ function SeatGrid({ layoutType, seats, assignment, studentById, draggedStudent, 
               const seat = seats.find((s) => s.row === r && s.col === c);
               if (!seat) return <div key={c} style={{ width: 108 }} />;
               return (
-                <SeatCell
-                  key={seat.id}
-                  seat={seat}
-                  student={assignment[seat.id] ? studentById[assignment[seat.id]] : null}
-                  draggedStudent={draggedStudent}
-                  setDraggedStudent={setDraggedStudent}
-                  handleDrop={handleDrop}
-                />
+                <SeatCell key={seat.id} seat={seat} student={assignment[seat.id] ? studentById[assignment[seat.id]] : null} draggedStudent={draggedStudent} setDraggedStudent={setDraggedStudent} handleDrop={handleDrop} />
               );
             })}
           </div>
@@ -1386,9 +1606,7 @@ function SeatCell({ seat, student, draggedStudent, setDraggedStudent, handleDrop
           <div style={{ fontSize: 12.5, fontWeight: 700, color: T.ink, lineHeight: 1.2, marginBottom: flagIcons.length ? 4 : 0 }}>
             {student.name || "—"}
           </div>
-          {flagIcons.length > 0 && (
-            <div style={{ display: "flex", gap: 4, color: T.brass }}>{flagIcons}</div>
-          )}
+          {flagIcons.length > 0 && <div style={{ display: "flex", gap: 4, color: T.brass }}>{flagIcons}</div>}
         </>
       ) : (
         <div style={{ fontSize: 11, color: "#C7BFAB", textAlign: "center" }}>empty</div>
