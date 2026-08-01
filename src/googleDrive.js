@@ -91,10 +91,25 @@ function driveFetch(path, options = {}) {
   });
 }
 
+// Surfaces Google's actual error message (e.g. "File not found: ...",
+// "Insufficient permission") instead of just an HTTP status code, so a
+// failure is diagnosable from the toast alone rather than guesswork.
+async function throwIfNotOk(res, action) {
+  if (res.ok) return;
+  let detail = "";
+  try {
+    const body = await res.json();
+    if (body?.error?.message) detail = ` — ${body.error.message}`;
+  } catch {
+    // response body wasn't JSON; fall back to just the status
+  }
+  throw new Error(`${action} failed (${res.status})${detail}`);
+}
+
 async function findFileIdByName(name) {
   const q = encodeURIComponent(`name='${name.replace(/'/g, "\\'")}' and trashed=false`);
   const res = await driveFetch(`files?q=${q}&spaces=drive&fields=files(id,name)`);
-  if (!res.ok) throw new Error(`Drive search failed (${res.status})`);
+  await throwIfNotOk(res, "Drive search");
   const json = await res.json();
   return json.files?.[0]?.id ?? null;
 }
@@ -129,7 +144,7 @@ export async function saveJsonToDrive(filename, dataObj) {
     },
     body,
   });
-  if (!res.ok) throw new Error(`Drive save failed (${res.status})`);
+  await throwIfNotOk(res, "Drive save");
   return res.json();
 }
 
@@ -185,7 +200,7 @@ export async function loadJsonFromDrive() {
   }
 
   const res = await driveFetch(`files/${file.id}?alt=media`);
-  if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
+  await throwIfNotOk(res, "Drive download");
   return res.json();
 }
 
@@ -219,7 +234,7 @@ export async function pickRosterFileFromDrive() {
   const res = await driveFetch(
     exportMime ? `files/${file.id}/export?mimeType=${exportMime}` : `files/${file.id}?alt=media`
   );
-  if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
+  await throwIfNotOk(res, "Drive download");
   return {
     name: file.name,
     mimeType: exportMime || file.mimeType,

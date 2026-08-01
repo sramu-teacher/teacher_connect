@@ -124,29 +124,46 @@ const PDF_METADATA_KEYWORDS = [
   "generated", "code", "class",
 ];
 
-function looksLikeStudentName(line) {
+// Extracts a name from a line of PDF text, or null if the line doesn't
+// look like it contains one. Rather than rejecting the whole line when
+// it contains a digit, this pulls out the longest run of consecutive
+// name-shaped tokens — so a table row like "John Smith  10  Rm 204"
+// (grade/room sharing the same visual line as the name, which pdf.js
+// merges into one line) still yields "John Smith" instead of nothing.
+function extractNameFromLine(line) {
   const trimmed = line.trim();
-  if (!trimmed) return false;
-  if (/\d/.test(trimmed)) return false; // dates, IDs, codes, page numbers ("Period 3", "8/1/2026")
-  if (/[:@]/.test(trimmed)) return false; // "School: Lincoln High", emails
+  if (!trimmed) return null;
+  if (/[:@]/.test(trimmed)) return null; // "School: Lincoln High", emails
 
-  const words = trimmed.split(/\s+/).filter(Boolean);
-  if (words.length < 2 || words.length > 4) return false; // real names are ~2-4 words
-
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
   const wordPattern = /^[A-Za-z][A-Za-z'-]*[,.]?$/;
-  if (!words.every((w) => wordPattern.test(w))) return false;
 
-  const lower = trimmed.toLowerCase();
-  if (PDF_METADATA_KEYWORDS.some((kw) => lower.includes(kw))) return false;
+  let bestStart = -1, bestLen = 0, curStart = -1, curLen = 0;
+  for (let i = 0; i <= tokens.length; i++) {
+    const isNameWord = i < tokens.length && wordPattern.test(tokens[i]);
+    if (isNameWord) {
+      if (curLen === 0) curStart = i;
+      curLen++;
+    } else {
+      if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+      curLen = 0;
+    }
+  }
+  if (bestLen < 2 || bestLen > 4) return null; // real names are ~2-4 words
 
-  return true;
+  const candidate = tokens.slice(bestStart, bestStart + bestLen).join(" ");
+  const lower = candidate.toLowerCase();
+  if (PDF_METADATA_KEYWORDS.some((kw) => lower.includes(kw))) return null;
+
+  return candidate;
 }
 
 function parsePdfRosterText(text) {
   return text
     .split(/\r?\n/)
-    .filter(looksLikeStudentName)
-    .map((line) => emptyStudent(line.trim()));
+    .map(extractNameFromLine)
+    .filter(Boolean)
+    .map((name) => emptyStudent(name));
 }
 
 // ---------- Seating algorithm ----------
