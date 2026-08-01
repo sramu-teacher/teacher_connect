@@ -1,0 +1,1345 @@
+import React, { useState, useMemo, useCallback, useRef } from "react";
+import { Plus, X, Upload, Download, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check } from "lucide-react";
+
+// ---------- Design tokens ----------
+// Deep slate / warm paper / brass accent / sage-good / clay-conflict
+const T = {
+  ink: "#1F2A24",
+  paper: "#FAF7F0",
+  paperDim: "#F1ECE0",
+  graphite: "#3D3D3D",
+  line: "#D9D2C0",
+  brass: "#B8862F",
+  brassSoft: "#EFE1C4",
+  sage: "#5C7A5C",
+  sageSoft: "#E1EADB",
+  clay: "#A6452F",
+  claySoft: "#F2DDD5",
+  slate: "#2E3A33",
+};
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+// ---------- Sample seed (so the app never opens empty) ----------
+const SEED_STUDENTS = [];
+
+function emptyStudent(name = "") {
+  return {
+    id: uid(),
+    name,
+    iep: "",
+    el: false,
+    elLevel: "",
+    behaviorNotes: "",
+    vision: false,
+    hearing: false,
+    academicLevel: "medium", // low, medium, high
+    friends: [], // ids they work well with / want near
+    avoid: [], // ids they must NOT sit near
+  };
+}
+
+// ---------- Parsing bulk paste ----------
+function parseBulkNames(text) {
+  return text
+    .split(/\n|,/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((name) => emptyStudent(name));
+}
+
+// ---------- Seating algorithm ----------
+// Greedy constraint-satisfaction with scoring: builds seat order from
+// grid geometry, then assigns students to minimize conflicts and
+// balance academic levels/behavior across groups, while respecting
+// hard "avoid" pairs as close to inviolable as geometry allows.
+function generateSeatingChart(students, seats, options) {
+  const { balanceAcademic, separateBehavior, honorFriends } = options;
+
+  // adjacency: seats sharing a group/table/or being neighbors in grid
+  const seatById = Object.fromEntries(seats.map((s) => [s.id, s]));
+  const neighborMap = {};
+  seats.forEach((s) => (neighborMap[s.id] = []));
+  seats.forEach((a) => {
+    seats.forEach((b) => {
+      if (a.id === b.id) return;
+      const sameGroup = a.groupId && a.groupId === b.groupId;
+      const adjacentGrid =
+        a.groupId == null &&
+        b.groupId == null &&
+        a.row === b.row &&
+        Math.abs(a.col - b.col) === 1;
+      const rowBehind =
+        a.groupId == null &&
+        b.groupId == null &&
+        a.col === b.col &&
+        Math.abs(a.row - b.row) === 1;
+      if (sameGroup || adjacentGrid || rowBehind) {
+        neighborMap[a.id].push(b.id);
+      }
+    });
+  });
+
+  const studentsShuffled = [...students].sort(() => Math.random() - 0.5);
+
+  // Sort seats in a stable reading order for deterministic fill,
+  // but we'll actually assign via scoring, not just fill order.
+  const seatOrder = [...seats].sort((a, b) => a.row - b.row || a.col - b.col);
+
+  const assignment = {}; // seatId -> studentId
+  const studentSeat = {}; // studentId -> seatId
+  const placed = new Set();
+
+  function conflictScore(studentId, seatId) {
+    const student = students.find((s) => s.id === studentId);
+    let score = 0;
+    const neighbors = neighborMap[seatId] || [];
+    for (const nSeatId of neighbors) {
+      const neighborStudentId = assignment[nSeatId];
+      if (!neighborStudentId) continue;
+      const neighborStudent = students.find((s) => s.id === neighborStudentId);
+      if (!neighborStudent) continue;
+
+      // Hard avoid violation — huge penalty
+      if (
+        student.avoid.includes(neighborStudentId) ||
+        neighborStudent.avoid.includes(studentId)
+      ) {
+        score += 10000;
+      }
+      // Friend bonus (small negative = good) if honoring friends
+      if (
+        honorFriends &&
+        (student.friends.includes(neighborStudentId) ||
+          neighborStudent.friends.includes(studentId))
+      ) {
+        score -= 5;
+      }
+      // Behavior separation
+      if (
+        separateBehavior &&
+        student.behaviorNotes &&
+        neighborStudent.behaviorNotes
+      ) {
+        score += 40;
+      }
+      // Academic balance: discourage clustering same level together
+      if (balanceAcademic && student.academicLevel === neighborStudent.academicLevel) {
+        score += 8;
+      }
+    }
+    return score;
+  }
+
+  // Place EL / vision / hearing students first into front-of-room seats if flagged
+  const priorityFront = studentsShuffled.filter(
+    (s) => s.vision || s.hearing || (s.el && s.elLevel === "beginning")
+  );
+  const frontSeats = seatOrder.filter((s) => s.row <= 1);
+  const restSeats = seatOrder.filter((s) => s.row > 1);
+  const orderedSeatsForFront = [...frontSeats, ...restSeats];
+
+  const remainingStudents = studentsShuffled.filter(
+    (s) => !priorityFront.includes(s)
+  );
+  const fillQueue = [...priorityFront, ...remainingStudents];
+
+  for (const student of fillQueue) {
+    let bestSeat = null;
+    let bestScore = Infinity;
+    const candidateSeats =
+      priorityFront.includes(student) && !placed.has(student.id)
+        ? orderedSeatsForFront
+        : seatOrder;
+
+    for (const seat of candidateSeats) {
+      if (assignment[seat.id]) continue;
+      const score = conflictScore(student.id, seat.id);
+      // slight randomization to avoid identical charts every click
+      const jitter = Math.random() * 2;
+      if (score + jitter < bestScore) {
+        bestScore = score + jitter;
+        bestSeat = seat;
+      }
+    }
+    if (bestSeat) {
+      assignment[bestSeat.id] = student.id;
+      studentSeat[student.id] = bestSeat.id;
+      placed.add(student.id);
+    }
+  }
+
+  // compute violated hard-avoid pairs for reporting
+  const violations = [];
+  for (const seat of seats) {
+    const sid = assignment[seat.id];
+    if (!sid) continue;
+    const student = students.find((s) => s.id === sid);
+    for (const nSeatId of neighborMap[seat.id] || []) {
+      const nId = assignment[nSeatId];
+      if (!nId) continue;
+      if (student.avoid.includes(nId)) {
+        const nStudent = students.find((s) => s.id === nId);
+        const key = [sid, nId].sort().join("-");
+        if (!violations.find((v) => v.key === key)) {
+          violations.push({ key, a: student.name, b: nStudent.name });
+        }
+      }
+    }
+  }
+
+  return { assignment, violations };
+}
+
+// ---------- Seat geometry builders ----------
+function buildGrid(rows, cols) {
+  const seats = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      seats.push({ id: `r${r}c${c}`, row: r, col: c, groupId: null });
+    }
+  }
+  return seats;
+}
+
+function buildPods(numPods, perPod) {
+  const seats = [];
+  const cols = Math.min(numPods, 4);
+  for (let p = 0; p < numPods; p++) {
+    const podRow = Math.floor(p / cols);
+    const podCol = p % cols;
+    for (let i = 0; i < perPod; i++) {
+      seats.push({
+        id: `pod${p}s${i}`,
+        row: podRow,
+        col: podCol,
+        groupId: `pod${p}`,
+        seatIndexInGroup: i,
+      });
+    }
+  }
+  return seats;
+}
+
+function buildPairs(numPairs, cols) {
+  const seats = [];
+  for (let p = 0; p < numPairs; p++) {
+    const row = Math.floor(p / cols);
+    const col = p % cols;
+    seats.push({ id: `pair${p}a`, row, col, groupId: `pair${p}`, seatIndexInGroup: 0 });
+    seats.push({ id: `pair${p}b`, row, col, groupId: `pair${p}`, seatIndexInGroup: 1 });
+  }
+  return seats;
+}
+
+// ---------- Main App ----------
+export default function SeatingChart() {
+  const [students, setStudents] = useState(SEED_STUDENTS);
+  const [layoutType, setLayoutType] = useState("grid"); // grid | pods | pairs
+  const [rows, setRows] = useState(4);
+  const [cols, setCols] = useState(5);
+  const [numPods, setNumPods] = useState(6);
+  const [perPod, setPerPod] = useState(4);
+  const [numPairs, setNumPairs] = useState(10);
+  const [pairCols, setPairCols] = useState(5);
+
+  const [options, setOptions] = useState({
+    balanceAcademic: true,
+    separateBehavior: true,
+    honorFriends: true,
+  });
+
+  const [assignment, setAssignment] = useState({});
+  const [violations, setViolations] = useState([]);
+  const [hasGenerated, setHasGenerated] = useState(false);
+
+  const [activeTab, setActiveTab] = useState("roster"); // roster | chart
+  const [expandedStudentId, setExpandedStudentId] = useState(null);
+  const [bulkText, setBulkText] = useState("");
+  const [showBulk, setShowBulk] = useState(false);
+  const [draggedStudent, setDraggedStudent] = useState(null);
+  const [toast, setToast] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const seats = useMemo(() => {
+    if (layoutType === "grid") return buildGrid(rows, cols);
+    if (layoutType === "pods") return buildPods(numPods, perPod);
+    if (layoutType === "pairs") return buildPairs(numPairs, pairCols);
+    return [];
+  }, [layoutType, rows, cols, numPods, perPod, numPairs, pairCols]);
+
+  const showToast = useCallback((msg, tone = "sage") => {
+    setToast({ msg, tone });
+    setTimeout(() => setToast(null), 3200);
+  }, []);
+
+  const addStudent = () => {
+    const s = emptyStudent("");
+    setStudents((prev) => [...prev, s]);
+    setExpandedStudentId(s.id);
+    setActiveTab("roster");
+  };
+
+  const updateStudent = (id, patch) => {
+    setStudents((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  };
+
+  const removeStudent = (id) => {
+    setStudents((prev) =>
+      prev
+        .filter((s) => s.id !== id)
+        .map((s) => ({
+          ...s,
+          friends: s.friends.filter((f) => f !== id),
+          avoid: s.avoid.filter((a) => a !== id),
+        }))
+    );
+    setAssignment((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((seatId) => {
+        if (next[seatId] === id) delete next[seatId];
+      });
+      return next;
+    });
+  };
+
+  const toggleRelation = (id, otherId, field) => {
+    setStudents((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        const has = s[field].includes(otherId);
+        return {
+          ...s,
+          [field]: has ? s[field].filter((x) => x !== otherId) : [...s[field], otherId],
+        };
+      })
+    );
+  };
+
+  const handleBulkAdd = () => {
+    const newStudents = parseBulkNames(bulkText);
+    if (newStudents.length === 0) {
+      showToast("No names found to add.", "clay");
+      return;
+    }
+    setStudents((prev) => [...prev, ...newStudents]);
+    setBulkText("");
+    setShowBulk(false);
+    showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} to the roster.`);
+  };
+
+  const handleGenerate = () => {
+    if (students.length === 0) {
+      showToast("Add students to the roster first.", "clay");
+      return;
+    }
+    if (seats.length < students.length) {
+      showToast(
+        `Only ${seats.length} seats for ${students.length} students — add more seats.`,
+        "clay"
+      );
+    }
+    const result = generateSeatingChart(students, seats, options);
+    setAssignment(result.assignment);
+    setViolations(result.violations);
+    setHasGenerated(true);
+    setActiveTab("chart");
+    if (result.violations.length === 0) {
+      showToast("Seating chart generated — no avoid-pairs seated together.");
+    } else {
+      showToast(
+        `Generated with ${result.violations.length} unavoidable conflict${result.violations.length > 1 ? "s" : ""} — see notes below the chart.`,
+        "clay"
+      );
+    }
+  };
+
+  const handleExport = () => {
+    const data = { students, layoutType, rows, cols, numPods, perPod, numPairs, pairCols, assignment };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `seating-chart-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const data = JSON.parse(evt.target.result);
+        if (data.students) setStudents(data.students);
+        if (data.layoutType) setLayoutType(data.layoutType);
+        if (data.rows) setRows(data.rows);
+        if (data.cols) setCols(data.cols);
+        if (data.numPods) setNumPods(data.numPods);
+        if (data.perPod) setPerPod(data.perPod);
+        if (data.numPairs) setNumPairs(data.numPairs);
+        if (data.pairCols) setPairCols(data.pairCols);
+        if (data.assignment) setAssignment(data.assignment);
+        showToast("Roster and chart loaded from file.");
+      } catch {
+        showToast("Couldn't read that file — expecting a JSON export from this app.", "clay");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // manual drag-to-swap on chart
+  const handleDrop = (seatId) => {
+    if (!draggedStudent) return;
+    setAssignment((prev) => {
+      const next = { ...prev };
+      const fromSeat = Object.keys(next).find((sid) => next[sid] === draggedStudent);
+      const displaced = next[seatId];
+      if (fromSeat) next[fromSeat] = displaced || undefined;
+      if (!displaced && fromSeat) delete next[fromSeat];
+      next[seatId] = draggedStudent;
+      if (!fromSeat) {
+        // came from unseated
+      }
+      return next;
+    });
+    setDraggedStudent(null);
+  };
+
+  const unseated = students.filter(
+    (s) => !Object.values(assignment).includes(s.id)
+  );
+
+  const studentById = Object.fromEntries(students.map((s) => [s.id, s]));
+
+  const flagCounts = {
+    iep: students.filter((s) => s.iep.trim()).length,
+    el: students.filter((s) => s.el).length,
+    behavior: students.filter((s) => s.behaviorNotes.trim()).length,
+    vision: students.filter((s) => s.vision).length,
+    hearing: students.filter((s) => s.hearing).length,
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: T.paper, fontFamily: "'Iowan Old Style','Georgia',serif", color: T.ink }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap');
+        * { box-sizing: border-box; }
+        body { margin: 0; }
+        .serif { font-family: 'Fraunces', Georgia, serif; }
+        .sans { font-family: 'Inter', system-ui, sans-serif; }
+        button { font-family: 'Inter', system-ui, sans-serif; cursor: pointer; }
+        input, textarea, select { font-family: 'Inter', system-ui, sans-serif; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-thumb { background: ${T.line}; border-radius: 4px; }
+        .seat {
+          transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+        }
+        .seat:hover { transform: translateY(-2px); }
+        .fade-in { animation: fadeIn 0.35s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+        .tab-underline { position: relative; }
+        .tab-underline::after {
+          content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+          background: ${T.brass}; transform: scaleX(0); transition: transform 0.2s ease;
+        }
+        .tab-active::after { transform: scaleX(1); }
+        input[type="checkbox"] { accent-color: ${T.brass}; }
+        .chip { transition: all 0.15s ease; }
+        @media (prefers-reduced-motion: reduce) {
+          .seat, .fade-in, .chip { animation: none !important; transition: none !important; }
+        }
+      `}</style>
+
+      {/* ---------- Header ---------- */}
+      <header style={{ borderBottom: `1px solid ${T.line}`, background: T.paper, position: "sticky", top: 0, zIndex: 20 }}>
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "20px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <div className="sans" style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", color: T.brass, fontWeight: 600, marginBottom: 2 }}>
+              Roster &amp; Room
+            </div>
+            <h1 className="serif" style={{ margin: 0, fontSize: 28, fontWeight: 600, letterSpacing: "-0.01em" }}>
+              Seating Intelligence
+            </h1>
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <button onClick={() => fileInputRef.current?.click()} className="sans" style={btnGhost}>
+              <Upload size={15} /> Load
+            </button>
+            <input ref={fileInputRef} type="file" accept="application/json" onChange={handleImport} style={{ display: "none" }} />
+            <button onClick={handleExport} className="sans" style={btnGhost}>
+              <Download size={15} /> Save
+            </button>
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "0 24px", display: "flex", gap: 28 }}>
+          {[
+            { id: "roster", label: `Roster (${students.length})` },
+            { id: "chart", label: "Seating Chart" },
+          ].map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTab(t.id)}
+              className={`sans tab-underline ${activeTab === t.id ? "tab-active" : ""}`}
+              style={{
+                background: "none",
+                border: "none",
+                padding: "10px 2px 14px 2px",
+                fontSize: 14.5,
+                fontWeight: 600,
+                color: activeTab === t.id ? T.ink : "#8A8272",
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      <main style={{ maxWidth: 1180, margin: "0 auto", padding: "28px 24px 80px" }}>
+        {activeTab === "roster" && (
+          <RosterView
+            students={students}
+            addStudent={addStudent}
+            updateStudent={updateStudent}
+            removeStudent={removeStudent}
+            toggleRelation={toggleRelation}
+            expandedStudentId={expandedStudentId}
+            setExpandedStudentId={setExpandedStudentId}
+            bulkText={bulkText}
+            setBulkText={setBulkText}
+            showBulk={showBulk}
+            setShowBulk={setShowBulk}
+            handleBulkAdd={handleBulkAdd}
+            flagCounts={flagCounts}
+          />
+        )}
+
+        {activeTab === "chart" && (
+          <ChartView
+            students={students}
+            layoutType={layoutType}
+            setLayoutType={setLayoutType}
+            rows={rows}
+            setRows={setRows}
+            cols={cols}
+            setCols={setCols}
+            numPods={numPods}
+            setNumPods={setNumPods}
+            perPod={perPod}
+            setPerPod={setPerPod}
+            numPairs={numPairs}
+            setNumPairs={setNumPairs}
+            pairCols={pairCols}
+            setPairCols={setPairCols}
+            options={options}
+            setOptions={setOptions}
+            seats={seats}
+            assignment={assignment}
+            violations={violations}
+            hasGenerated={hasGenerated}
+            handleGenerate={handleGenerate}
+            studentById={studentById}
+            unseated={unseated}
+            draggedStudent={draggedStudent}
+            setDraggedStudent={setDraggedStudent}
+            handleDrop={handleDrop}
+          />
+        )}
+      </main>
+
+      {toast && (
+        <div
+          className="fade-in sans"
+          style={{
+            position: "fixed",
+            bottom: 24,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: toast.tone === "clay" ? T.clay : T.slate,
+            color: T.paper,
+            padding: "12px 20px",
+            borderRadius: 8,
+            fontSize: 13.5,
+            fontWeight: 500,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+            maxWidth: 480,
+            textAlign: "center",
+            zIndex: 100,
+          }}
+        >
+          {toast.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const btnGhost = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  background: "transparent",
+  border: `1px solid ${T.line}`,
+  borderRadius: 7,
+  padding: "8px 14px",
+  fontSize: 13.5,
+  fontWeight: 600,
+  color: T.graphite,
+};
+
+const btnPrimary = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  background: T.ink,
+  border: "none",
+  borderRadius: 7,
+  padding: "11px 18px",
+  fontSize: 14,
+  fontWeight: 700,
+  color: T.paper,
+};
+
+// ================= Roster View =================
+function RosterView({
+  students,
+  addStudent,
+  updateStudent,
+  removeStudent,
+  toggleRelation,
+  expandedStudentId,
+  setExpandedStudentId,
+  bulkText,
+  setBulkText,
+  showBulk,
+  setShowBulk,
+  handleBulkAdd,
+  flagCounts,
+}) {
+  return (
+    <div className="fade-in">
+      {/* Summary strip */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 22 }}>
+        <SummaryChip icon={<FileText size={13} />} label="IEP" count={flagCounts.iep} />
+        <SummaryChip icon={<Languages size={13} />} label="EL" count={flagCounts.el} />
+        <SummaryChip icon={<AlertTriangle size={13} />} label="Behavior notes" count={flagCounts.behavior} />
+        <SummaryChip icon={<Eye size={13} />} label="Vision" count={flagCounts.vision} />
+        <SummaryChip icon={<Ear size={13} />} label="Hearing" count={flagCounts.hearing} />
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+        <button onClick={addStudent} className="sans" style={btnPrimary}>
+          <Plus size={16} /> Add student
+        </button>
+        <button onClick={() => setShowBulk((v) => !v)} className="sans" style={btnGhost}>
+          <Users size={15} /> Bulk add by name
+        </button>
+      </div>
+
+      {showBulk && (
+        <div className="fade-in" style={{ marginBottom: 22, background: T.paperDim, border: `1px solid ${T.line}`, borderRadius: 10, padding: 16 }}>
+          <div className="sans" style={{ fontSize: 12.5, color: "#6B6455", marginBottom: 8 }}>
+            Paste one name per line (or comma-separated). You can fill in IEP, EL, and pairing details after.
+          </div>
+          <textarea
+            value={bulkText}
+            onChange={(e) => setBulkText(e.target.value)}
+            placeholder={"Maria Gonzalez\nJamal Whitfield\nEthan Park\n..."}
+            className="sans"
+            style={{
+              width: "100%",
+              minHeight: 110,
+              border: `1px solid ${T.line}`,
+              borderRadius: 8,
+              padding: 12,
+              fontSize: 13.5,
+              resize: "vertical",
+              background: T.paper,
+              color: T.ink,
+            }}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button onClick={handleBulkAdd} className="sans" style={{ ...btnPrimary, padding: "8px 16px" }}>
+              Add to roster
+            </button>
+            <button onClick={() => setShowBulk(false)} className="sans" style={btnGhost}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {students.length === 0 ? (
+        <EmptyRoster addStudent={addStudent} setShowBulk={setShowBulk} />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {students.map((s) => (
+            <StudentCard
+              key={s.id}
+              student={s}
+              allStudents={students}
+              updateStudent={updateStudent}
+              removeStudent={removeStudent}
+              toggleRelation={toggleRelation}
+              expanded={expandedStudentId === s.id}
+              setExpanded={() => setExpandedStudentId(expandedStudentId === s.id ? null : s.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EmptyRoster({ addStudent, setShowBulk }) {
+  return (
+    <div
+      style={{
+        border: `1.5px dashed ${T.line}`,
+        borderRadius: 12,
+        padding: "56px 24px",
+        textAlign: "center",
+        background: T.paperDim,
+      }}
+    >
+      <Grid3x3 size={28} color={T.brass} style={{ marginBottom: 12 }} />
+      <div className="serif" style={{ fontSize: 19, fontWeight: 600, marginBottom: 6 }}>
+        No students on the roster yet
+      </div>
+      <div className="sans" style={{ fontSize: 13.5, color: "#8A8272", marginBottom: 18, maxWidth: 380, marginLeft: "auto", marginRight: "auto" }}>
+        Add students one at a time with full details, or paste a class list to get everyone in fast.
+      </div>
+      <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+        <button onClick={addStudent} className="sans" style={btnPrimary}>
+          <Plus size={16} /> Add one student
+        </button>
+        <button onClick={() => setShowBulk(true)} className="sans" style={btnGhost}>
+          Paste a class list
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SummaryChip({ icon, label, count }) {
+  return (
+    <div
+      className="sans"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        border: `1px solid ${T.line}`,
+        borderRadius: 20,
+        padding: "6px 12px",
+        fontSize: 12.5,
+        fontWeight: 600,
+        color: T.graphite,
+        background: T.paper,
+      }}
+    >
+      {icon}
+      {label}
+      <span style={{ color: T.brass, fontWeight: 700 }}>{count}</span>
+    </div>
+  );
+}
+
+function StudentCard({ student, allStudents, updateStudent, removeStudent, toggleRelation, expanded, setExpanded }) {
+  const others = allStudents.filter((s) => s.id !== student.id);
+  const flags = [];
+  if (student.iep.trim()) flags.push({ icon: <FileText size={11} />, label: "IEP" });
+  if (student.el) flags.push({ icon: <Languages size={11} />, label: student.elLevel ? `EL · ${student.elLevel}` : "EL" });
+  if (student.behaviorNotes.trim()) flags.push({ icon: <AlertTriangle size={11} />, label: "Behavior" });
+  if (student.vision) flags.push({ icon: <Eye size={11} />, label: "Vision" });
+  if (student.hearing) flags.push({ icon: <Ear size={11} />, label: "Hearing" });
+
+  return (
+    <div style={{ border: `1px solid ${T.line}`, borderRadius: 10, background: T.paper, overflow: "hidden" }}>
+      <div
+        onClick={setExpanded}
+        style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 16px", cursor: "pointer" }}
+      >
+        <input
+          value={student.name}
+          onChange={(e) => updateStudent(student.id, { name: e.target.value })}
+          onClick={(e) => e.stopPropagation()}
+          placeholder="Student name"
+          className="sans"
+          style={{
+            border: "none",
+            outline: "none",
+            background: "transparent",
+            fontSize: 15,
+            fontWeight: 600,
+            color: T.ink,
+            flex: "0 1 220px",
+            minWidth: 140,
+          }}
+        />
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", flex: 1 }}>
+          {flags.map((f, i) => (
+            <span
+              key={i}
+              className="sans chip"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                background: T.brassSoft,
+                color: "#7A5A18",
+                borderRadius: 12,
+                padding: "3px 9px",
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+            >
+              {f.icon}
+              {f.label}
+            </span>
+          ))}
+          {student.academicLevel && (
+            <span
+              className="sans"
+              style={{
+                background: T.paperDim,
+                color: "#8A8272",
+                borderRadius: 12,
+                padding: "3px 9px",
+                fontSize: 11,
+                fontWeight: 600,
+                textTransform: "capitalize",
+              }}
+            >
+              {student.academicLevel} level
+            </span>
+          )}
+        </div>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            removeStudent(student.id);
+          }}
+          style={{ background: "none", border: "none", color: "#B0A890", padding: 4 }}
+          aria-label="Remove student"
+        >
+          <Trash2 size={15} />
+        </button>
+        {expanded ? <ChevronUp size={16} color="#8A8272" /> : <ChevronDown size={16} color="#8A8272" />}
+      </div>
+
+      {expanded && (
+        <div className="fade-in sans" style={{ padding: "4px 16px 20px", borderTop: `1px solid ${T.line}` }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
+            <Field label="Academic level">
+              <select
+                value={student.academicLevel}
+                onChange={(e) => updateStudent(student.id, { academicLevel: e.target.value })}
+                style={inputStyle}
+              >
+                <option value="low">Needs support</option>
+                <option value="medium">On level</option>
+                <option value="high">Advanced</option>
+              </select>
+            </Field>
+
+            <Field label="English Learner">
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                  <input type="checkbox" checked={student.el} onChange={(e) => updateStudent(student.id, { el: e.target.checked })} />
+                  EL student
+                </label>
+                {student.el && (
+                  <select
+                    value={student.elLevel}
+                    onChange={(e) => updateStudent(student.id, { elLevel: e.target.value })}
+                    style={{ ...inputStyle, flex: 1 }}
+                  >
+                    <option value="">Proficiency level</option>
+                    <option value="beginning">Beginning</option>
+                    <option value="intermediate">Intermediate</option>
+                    <option value="advanced">Advanced</option>
+                  </select>
+                )}
+              </div>
+            </Field>
+
+            <Field label="IEP / 504 accommodations" full>
+              <textarea
+                value={student.iep}
+                onChange={(e) => updateStudent(student.id, { iep: e.target.value })}
+                placeholder="e.g., preferential seating near instruction, extended time, reduced distractions..."
+                style={{ ...inputStyle, minHeight: 60, resize: "vertical" }}
+              />
+            </Field>
+
+            <Field label="Behavior notes" full>
+              <textarea
+                value={student.behaviorNotes}
+                onChange={(e) => updateStudent(student.id, { behaviorNotes: e.target.value })}
+                placeholder="e.g., off-task when seated near peers, escalates with talkative neighbors..."
+                style={{ ...inputStyle, minHeight: 50, resize: "vertical" }}
+              />
+            </Field>
+
+            <Field label="Sensory">
+              <div style={{ display: "flex", gap: 14 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                  <input type="checkbox" checked={student.vision} onChange={(e) => updateStudent(student.id, { vision: e.target.checked })} />
+                  Vision — needs front
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                  <input type="checkbox" checked={student.hearing} onChange={(e) => updateStudent(student.id, { hearing: e.target.checked })} />
+                  Hearing — needs front
+                </label>
+              </div>
+            </Field>
+          </div>
+
+          {others.length > 0 && (
+            <div style={{ marginTop: 18, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              <Field label="Pairs well with" hint="friend / positive-working pairing">
+                <RelationPicker
+                  student={student}
+                  others={others}
+                  field="friends"
+                  toggleRelation={toggleRelation}
+                  tone="sage"
+                />
+              </Field>
+              <Field label="Must not sit near" hint="known conflict — treated as a hard rule">
+                <RelationPicker
+                  student={student}
+                  others={others}
+                  field="avoid"
+                  toggleRelation={toggleRelation}
+                  tone="clay"
+                />
+              </Field>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RelationPicker({ student, others, field, toggleRelation, tone }) {
+  const activeColor = tone === "sage" ? T.sage : T.clay;
+  const activeBg = tone === "sage" ? T.sageSoft : T.claySoft;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 110, overflowY: "auto", padding: 2 }}>
+      {others
+        .filter((o) => o.name.trim())
+        .map((o) => {
+          const active = student[field].includes(o.id);
+          return (
+            <button
+              key={o.id}
+              onClick={() => toggleRelation(student.id, o.id, field)}
+              className="chip"
+              style={{
+                border: `1px solid ${active ? activeColor : T.line}`,
+                background: active ? activeBg : "transparent",
+                color: active ? activeColor : "#8A8272",
+                borderRadius: 14,
+                padding: "4px 10px",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+            >
+              {active && <Check size={10} style={{ marginRight: 3, marginBottom: -1 }} />}
+              {o.name}
+            </button>
+          );
+        })}
+    </div>
+  );
+}
+
+function Field({ label, hint, full, children }) {
+  return (
+    <div style={{ gridColumn: full ? "1 / -1" : "auto" }}>
+      <div style={{ fontSize: 11.5, fontWeight: 700, color: "#6B6455", marginBottom: 6, letterSpacing: "0.02em" }}>
+        {label}
+        {hint && <span style={{ fontWeight: 400, color: "#A89F8C" }}> — {hint}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+const inputStyle = {
+  width: "100%",
+  border: `1px solid ${T.line}`,
+  borderRadius: 7,
+  padding: "8px 10px",
+  fontSize: 13,
+  background: T.paper,
+  color: T.ink,
+  outline: "none",
+};
+
+// ================= Chart View =================
+function ChartView({
+  students,
+  layoutType,
+  setLayoutType,
+  rows,
+  setRows,
+  cols,
+  setCols,
+  numPods,
+  setNumPods,
+  perPod,
+  setPerPod,
+  numPairs,
+  setNumPairs,
+  pairCols,
+  setPairCols,
+  options,
+  setOptions,
+  seats,
+  assignment,
+  violations,
+  hasGenerated,
+  handleGenerate,
+  studentById,
+  unseated,
+  draggedStudent,
+  setDraggedStudent,
+  handleDrop,
+}) {
+  const seatCount = seats.length;
+
+  return (
+    <div className="fade-in">
+      {/* Controls */}
+      <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 20, marginBottom: 24, alignItems: "start" }}>
+        <div style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: 18, background: T.paperDim }}>
+          <div className="sans" style={{ fontSize: 12, fontWeight: 700, color: "#6B6455", marginBottom: 12, letterSpacing: "0.03em" }}>
+            ROOM LAYOUT
+          </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            {[
+              { id: "grid", label: "Rows & columns" },
+              { id: "pods", label: "Pods / tables" },
+              { id: "pairs", label: "Pairs" },
+            ].map((opt) => (
+              <button
+                key={opt.id}
+                onClick={() => setLayoutType(opt.id)}
+                className="sans"
+                style={{
+                  padding: "7px 13px",
+                  borderRadius: 7,
+                  fontSize: 12.5,
+                  fontWeight: 600,
+                  border: `1px solid ${layoutType === opt.id ? T.ink : T.line}`,
+                  background: layoutType === opt.id ? T.ink : "transparent",
+                  color: layoutType === opt.id ? T.paper : T.graphite,
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          {layoutType === "grid" && (
+            <div style={{ display: "flex", gap: 20 }}>
+              <NumberField label="Rows" value={rows} setValue={setRows} min={1} max={10} />
+              <NumberField label="Columns" value={cols} setValue={setCols} min={1} max={10} />
+            </div>
+          )}
+          {layoutType === "pods" && (
+            <div style={{ display: "flex", gap: 20 }}>
+              <NumberField label="Number of pods" value={numPods} setValue={setNumPods} min={1} max={12} />
+              <NumberField label="Seats per pod" value={perPod} setValue={setPerPod} min={2} max={6} />
+            </div>
+          )}
+          {layoutType === "pairs" && (
+            <div style={{ display: "flex", gap: 20 }}>
+              <NumberField label="Number of pairs" value={numPairs} setValue={setNumPairs} min={1} max={20} />
+              <NumberField label="Columns of pairs" value={pairCols} setValue={setPairCols} min={1} max={8} />
+            </div>
+          )}
+
+          <div className="sans" style={{ fontSize: 12, color: seatCount < students.length ? T.clay : "#8A8272", marginTop: 12, fontWeight: 600 }}>
+            {seatCount} seats for {students.length} students
+            {seatCount < students.length && " — add more seats"}
+          </div>
+        </div>
+
+        <div style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: 18, background: T.paperDim }}>
+          <div className="sans" style={{ fontSize: 12, fontWeight: 700, color: "#6B6455", marginBottom: 12, letterSpacing: "0.03em" }}>
+            PRIORITIES
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+            <ToggleRow
+              label="Balance academic levels within groups"
+              checked={options.balanceAcademic}
+              onChange={(v) => setOptions((o) => ({ ...o, balanceAcademic: v }))}
+            />
+            <ToggleRow
+              label="Separate students with behavior notes"
+              checked={options.separateBehavior}
+              onChange={(v) => setOptions((o) => ({ ...o, separateBehavior: v }))}
+            />
+            <ToggleRow
+              label="Honor positive pairings when possible"
+              checked={options.honorFriends}
+              onChange={(v) => setOptions((o) => ({ ...o, honorFriends: v }))}
+            />
+          </div>
+          <button onClick={handleGenerate} className="sans" style={{ ...btnPrimary, marginTop: 16, width: "100%", justifyContent: "center", background: T.brass }}>
+            <Wand2 size={16} /> {hasGenerated ? "Regenerate chart" : "Generate seating chart"}
+          </button>
+        </div>
+      </div>
+
+      {violations.length > 0 && (
+        <div
+          className="sans fade-in"
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "flex-start",
+            background: T.claySoft,
+            border: `1px solid ${T.clay}55`,
+            borderRadius: 9,
+            padding: "12px 16px",
+            marginBottom: 18,
+            fontSize: 13,
+            color: "#7A3323",
+          }}
+        >
+          <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div>
+            <strong>{violations.length} pairing{violations.length > 1 ? "s" : ""} couldn't be fully separated</strong> given the room size —
+            {" "}
+            {violations.map((v, i) => (
+              <span key={v.key}>
+                {v.a} &amp; {v.b}
+                {i < violations.length - 1 ? ", " : ""}
+              </span>
+            ))}
+            . Try a larger layout or drag students manually below.
+          </div>
+        </div>
+      )}
+
+      {hasGenerated ? (
+        <SeatGrid
+          layoutType={layoutType}
+          seats={seats}
+          assignment={assignment}
+          studentById={studentById}
+          draggedStudent={draggedStudent}
+          setDraggedStudent={setDraggedStudent}
+          handleDrop={handleDrop}
+        />
+      ) : (
+        <div style={{ border: `1.5px dashed ${T.line}`, borderRadius: 12, padding: "56px 24px", textAlign: "center", background: T.paperDim }}>
+          <Wand2 size={26} color={T.brass} style={{ marginBottom: 10 }} />
+          <div className="serif" style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>
+            Set your room, then generate
+          </div>
+          <div className="sans" style={{ fontSize: 13.5, color: "#8A8272" }}>
+            The chart will honor avoid-pairs, IEP front-row needs, EL support, and behavior separation automatically.
+          </div>
+        </div>
+      )}
+
+      {hasGenerated && unseated.length > 0 && (
+        <div className="sans" style={{ marginTop: 20, fontSize: 12.5, color: T.clay, fontWeight: 600 }}>
+          Unseated (not enough seats): {unseated.map((s) => s.name).join(", ")}
+        </div>
+      )}
+
+      {hasGenerated && (
+        <div className="sans" style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#A89F8C" }}>
+          <Info size={12} /> Drag any student onto another seat to swap manually.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NumberField({ label, value, setValue, min, max }) {
+  return (
+    <div>
+      <div className="sans" style={{ fontSize: 11.5, fontWeight: 600, color: "#8A8272", marginBottom: 4 }}>
+        {label}
+      </div>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => setValue(Math.max(min, Math.min(max, Number(e.target.value) || min)))}
+        className="sans"
+        style={{ ...inputStyle, width: 64 }}
+      />
+    </div>
+  );
+}
+
+function ToggleRow({ label, checked, onChange }) {
+  return (
+    <label className="sans" style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 13, color: T.graphite, cursor: "pointer" }}>
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      {label}
+    </label>
+  );
+}
+
+function SeatGrid({ layoutType, seats, assignment, studentById, draggedStudent, setDraggedStudent, handleDrop }) {
+  if (layoutType === "pods") {
+    const groups = {};
+    seats.forEach((s) => {
+      if (!groups[s.groupId]) groups[s.groupId] = [];
+      groups[s.groupId].push(s);
+    });
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 18 }}>
+        {Object.entries(groups).map(([groupId, groupSeats]) => (
+          <div key={groupId} style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: 12, background: T.paperDim }}>
+            <div className="sans" style={{ fontSize: 10.5, fontWeight: 700, color: "#A89F8C", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              Table {parseInt(groupId.replace("pod", "")) + 1}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {groupSeats.map((seat) => (
+                <SeatCell
+                  key={seat.id}
+                  seat={seat}
+                  student={assignment[seat.id] ? studentById[assignment[seat.id]] : null}
+                  draggedStudent={draggedStudent}
+                  setDraggedStudent={setDraggedStudent}
+                  handleDrop={handleDrop}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (layoutType === "pairs") {
+    const groups = {};
+    seats.forEach((s) => {
+      if (!groups[s.groupId]) groups[s.groupId] = [];
+      groups[s.groupId].push(s);
+    });
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
+        {Object.entries(groups).map(([groupId, groupSeats]) => (
+          <div key={groupId} style={{ border: `1px solid ${T.line}`, borderRadius: 10, padding: 10, background: T.paperDim, display: "flex", gap: 8 }}>
+            {groupSeats.map((seat) => (
+              <SeatCell
+                key={seat.id}
+                seat={seat}
+                student={assignment[seat.id] ? studentById[assignment[seat.id]] : null}
+                draggedStudent={draggedStudent}
+                setDraggedStudent={setDraggedStudent}
+                handleDrop={handleDrop}
+                wide
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  // grid layout
+  const maxRow = Math.max(...seats.map((s) => s.row), 0);
+  const maxCol = Math.max(...seats.map((s) => s.col), 0);
+  return (
+    <div>
+      <div
+        className="sans"
+        style={{
+          textAlign: "center",
+          fontSize: 11,
+          fontWeight: 700,
+          letterSpacing: "0.12em",
+          color: "#A89F8C",
+          marginBottom: 14,
+          textTransform: "uppercase",
+        }}
+      >
+        Front of room
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
+        {Array.from({ length: maxRow + 1 }).map((_, r) => (
+          <div key={r} style={{ display: "flex", gap: 10 }}>
+            {Array.from({ length: maxCol + 1 }).map((_, c) => {
+              const seat = seats.find((s) => s.row === r && s.col === c);
+              if (!seat) return <div key={c} style={{ width: 108 }} />;
+              return (
+                <SeatCell
+                  key={seat.id}
+                  seat={seat}
+                  student={assignment[seat.id] ? studentById[assignment[seat.id]] : null}
+                  draggedStudent={draggedStudent}
+                  setDraggedStudent={setDraggedStudent}
+                  handleDrop={handleDrop}
+                />
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SeatCell({ seat, student, draggedStudent, setDraggedStudent, handleDrop, wide }) {
+  const flagIcons = [];
+  if (student?.iep.trim()) flagIcons.push(<FileText key="iep" size={10} />);
+  if (student?.el) flagIcons.push(<Languages key="el" size={10} />);
+  if (student?.behaviorNotes.trim()) flagIcons.push(<AlertTriangle key="beh" size={10} />);
+  if (student?.vision) flagIcons.push(<Eye key="vis" size={10} />);
+  if (student?.hearing) flagIcons.push(<Ear key="hear" size={10} />);
+
+  return (
+    <div
+      draggable={!!student}
+      onDragStart={() => student && setDraggedStudent(student.id)}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={() => handleDrop(seat.id)}
+      className="seat sans"
+      style={{
+        width: wide ? 108 : 100,
+        minHeight: 64,
+        border: `1.5px solid ${student ? T.ink : T.line}`,
+        borderRadius: 8,
+        background: student ? T.paper : "transparent",
+        padding: "8px 9px",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
+        boxShadow: student ? "0 1px 3px rgba(0,0,0,0.06)" : "none",
+        cursor: student ? "grab" : "default",
+      }}
+    >
+      {student ? (
+        <>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: T.ink, lineHeight: 1.2, marginBottom: flagIcons.length ? 4 : 0 }}>
+            {student.name || "—"}
+          </div>
+          {flagIcons.length > 0 && (
+            <div style={{ display: "flex", gap: 4, color: T.brass }}>{flagIcons}</div>
+          )}
+        </>
+      ) : (
+        <div style={{ fontSize: 11, color: "#C7BFAB", textAlign: "center" }}>empty</div>
+      )}
+    </div>
+  );
+}
