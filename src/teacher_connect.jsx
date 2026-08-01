@@ -419,13 +419,30 @@ export default function SeatingChart() {
     showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} to ${activePeriod}.`);
   };
 
-  const addImportedStudents = (newStudents, sourceName, extraNote = "") => {
-    if (newStudents.length === 0) {
+  // Re-uploading the same (or an updated) roster file for a period should
+  // never remove or overwrite existing students — it only adds names that
+  // aren't already on the roster (matched case-insensitively), and reports
+  // the delta so the teacher knows what actually changed.
+  const addImportedStudents = (parsedStudents, sourceName, extraNote = "") => {
+    if (parsedStudents.length === 0) {
       showToast(`Couldn't find any names in ${sourceName}.`, "clay");
-      return;
+      return { added: 0, duplicates: 0 };
     }
+    const existingNames = new Set(period.students.map((s) => s.name.trim().toLowerCase()));
+    const newStudents = parsedStudents.filter((s) => !existingNames.has(s.name.trim().toLowerCase()));
+    const duplicates = parsedStudents.length - newStudents.length;
+
+    if (newStudents.length === 0) {
+      showToast(`Everyone in ${sourceName} is already on the ${activePeriod} roster — nothing new to add.`, "sage");
+      return { added: 0, duplicates };
+    }
+
     updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
-    showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} from ${sourceName} to ${activePeriod}.${extraNote}`);
+    const dupeNote = duplicates > 0 ? ` ${duplicates} already on the roster ${duplicates > 1 ? "were" : "was"} left unchanged.` : "";
+    showToast(
+      `Added ${newStudents.length} new student${newStudents.length > 1 ? "s" : ""} from ${sourceName} to ${activePeriod}.${dupeNote}${extraNote}`
+    );
+    return { added: newStudents.length, duplicates };
   };
 
   const handleRosterFile = (file) => {
@@ -471,15 +488,12 @@ export default function SeatingChart() {
       const parsed = isPdf
         ? parsePdfRosterText(await extractTextFromPdf(picked.arrayBuffer))
         : parseRosterFile(new TextDecoder().decode(picked.arrayBuffer), picked.name);
-      if (parsed.length === 0) {
-        showToast(`Couldn't find any names in "${picked.name}".`, "clay");
-        return;
-      }
-      const existingNames = new Set(period.students.map((s) => s.name.trim().toLowerCase()));
-      const newStudents = parsed.filter((s) => !existingNames.has(s.name.toLowerCase()));
-      updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
-      setDriveResult({ fileName: picked.name, count: newStudents.length });
-      showToast(`Imported ${newStudents.length} student${newStudents.length !== 1 ? "s" : ""} from "${picked.name}" into ${activePeriod}.`);
+      const { added, duplicates } = addImportedStudents(
+        parsed,
+        `"${picked.name}"`,
+        isPdf ? " PDF layout can affect accuracy — please review the roster." : ""
+      );
+      setDriveResult({ fileName: picked.name, count: added, duplicates });
     } catch (err) {
       showToast(err.message || "Couldn't import from Drive — try again.", "clay");
     } finally {
@@ -525,7 +539,9 @@ export default function SeatingChart() {
     const a = document.createElement("a");
     a.href = url;
     a.download = `seating-chart-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
@@ -646,7 +662,7 @@ export default function SeatingChart() {
               id="load-json-input"
               ref={fileInputRef}
               type="file"
-              accept="application/json"
+              accept=".json,application/json"
               onChange={handleImport}
               style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
             />
@@ -747,6 +763,7 @@ export default function SeatingChart() {
             setPeriodNotes={(text) => updatePeriod({ periodNotes: text })}
             addStudent={addStudent}
             updateStudent={updateStudent}
+            showToast={showToast}
             removeStudent={removeStudent}
             toggleRelation={toggleRelation}
             logObservation={logObservation}
@@ -867,6 +884,7 @@ function RosterView({
   setPeriodNotes,
   addStudent,
   updateStudent,
+  showToast,
   removeStudent,
   toggleRelation,
   logObservation,
@@ -988,7 +1006,8 @@ function RosterView({
         </div>
         {driveResult && (
           <div className="sans fade-in" style={{ fontSize: 12, color: T.sage, marginTop: 8, fontWeight: 600 }}>
-            Imported {driveResult.count} student{driveResult.count !== 1 ? "s" : ""} from "{driveResult.fileName}".
+            Imported {driveResult.count} new student{driveResult.count !== 1 ? "s" : ""} from "{driveResult.fileName}"
+            {driveResult.duplicates > 0 ? ` (${driveResult.duplicates} already on the roster, skipped)` : ""}.
           </div>
         )}
       </div>
@@ -1045,6 +1064,7 @@ function RosterView({
               student={s}
               allStudents={students}
               updateStudent={updateStudent}
+              showToast={showToast}
               removeStudent={removeStudent}
               toggleRelation={toggleRelation}
               logObservation={logObservation}
@@ -1105,10 +1125,40 @@ function SummaryChip({ icon, label, count }) {
   );
 }
 
-function StudentCard({ student, allStudents, updateStudent, removeStudent, toggleRelation, logObservation, removeObservation, expanded, setExpanded }) {
+function StudentCard({ student, allStudents, updateStudent, showToast, removeStudent, toggleRelation, logObservation, removeObservation, expanded, setExpanded }) {
   const others = allStudents.filter((s) => s.id !== student.id);
   const [obsText, setObsText] = useState("");
   const [obsFlag, setObsFlag] = useState(false);
+  const [iepUploading, setIepUploading] = useState(false);
+
+  // Extracts text from an uploaded IEP document (PDF or plain text) and
+  // appends it to this student's existing IEP notes rather than replacing
+  // them, so re-uploading an updated IEP each year keeps prior history.
+  const handleIepFile = async (file) => {
+    if (!file) return;
+    const lowerName = file.name.toLowerCase();
+    const isPdf = lowerName.endsWith(".pdf");
+    if (!isPdf && !lowerName.endsWith(".txt")) {
+      showToast("Please upload a .pdf or .txt IEP document.", "clay");
+      return;
+    }
+    setIepUploading(true);
+    try {
+      const text = (isPdf ? await extractTextFromPdf(await file.arrayBuffer()) : await file.text()).trim();
+      if (!text) {
+        showToast("Couldn't find any text in that file — it may be a scanned image.", "clay");
+        return;
+      }
+      const stamp = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+      const merged = student.iep ? `${student.iep}\n\n--- Uploaded ${stamp} (${file.name}) ---\n${text}` : text;
+      updateStudent(student.id, { iep: merged });
+      showToast(`IEP document added for ${student.name || "this student"}.`);
+    } catch {
+      showToast("Couldn't read that IEP document — it may be a scanned image rather than real text.", "clay");
+    } finally {
+      setIepUploading(false);
+    }
+  };
 
   const flags = [];
   if (student.iep.trim()) flags.push({ icon: <FileText size={11} />, label: "IEP" });
@@ -1198,13 +1248,33 @@ function StudentCard({ student, allStudents, updateStudent, removeStudent, toggl
               </div>
             </Field>
 
-            <Field label="IEP / 504 accommodations" full>
+            <Field label="IEP / 504 accommodations" full hint="upload a document to append its text below">
               <textarea
                 value={student.iep}
                 onChange={(e) => updateStudent(student.id, { iep: e.target.value })}
                 placeholder="e.g., preferential seating near instruction, extended time, reduced distractions..."
                 style={{ ...inputStyle, minHeight: 60, resize: "vertical" }}
               />
+              <div style={{ marginTop: 6, position: "relative" }}>
+                <label
+                  htmlFor={`iep-file-${student.id}`}
+                  className="sans"
+                  style={{ ...btnGhost, display: "inline-flex", padding: "5px 10px", fontSize: 11.5, opacity: iepUploading ? 0.6 : 1 }}
+                >
+                  {iepUploading ? <Loader2 size={12} className="spin" /> : <Upload size={12} />}
+                  {iepUploading ? "Reading document…" : "Upload IEP document"}
+                </label>
+                <input
+                  id={`iep-file-${student.id}`}
+                  type="file"
+                  accept=".pdf,.txt,application/pdf,text/plain"
+                  onChange={(e) => {
+                    handleIepFile(e.target.files?.[0]);
+                    e.target.value = "";
+                  }}
+                  style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+                />
+              </div>
             </Field>
 
             <Field label="Behavior notes" full hint="also updated automatically by flagged observations below">
