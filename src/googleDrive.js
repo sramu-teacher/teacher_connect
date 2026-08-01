@@ -133,16 +133,16 @@ export async function saveJsonToDrive(filename, dataObj) {
   return res.json();
 }
 
-// Opens Google's file picker (scoped to the teacher's Drive) so they can
-// choose a JSON export to load, then returns the parsed file contents.
-export async function loadJsonFromDrive() {
-  ensureConfigured();
+// Opens Google's file picker restricted to the given mime types and
+// resolves with the picked doc's { id, name, mimeType }, or null if the
+// teacher cancels.
+async function pickDriveFile(mimeTypes) {
   const token = await getAccessToken();
   await ensureGapiPicker();
 
-  const fileId = await new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const view = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS)
-      .setMimeTypes("application/json")
+      .setMimeTypes(mimeTypes)
       .setIncludeFolders(true);
     const picker = new window.google.picker.PickerBuilder()
       .addView(view)
@@ -150,7 +150,7 @@ export async function loadJsonFromDrive() {
       .setDeveloperKey(API_KEY)
       .setCallback((data) => {
         if (data.action === window.google.picker.Action.PICKED) {
-          resolve(data.docs[0].id);
+          resolve(data.docs[0]);
         } else if (data.action === window.google.picker.Action.CANCEL) {
           resolve(null);
         }
@@ -158,10 +158,42 @@ export async function loadJsonFromDrive() {
       .build();
     picker.setVisible(true);
   });
+}
 
-  if (!fileId) return null;
+// Opens Google's file picker (scoped to the teacher's Drive) so they can
+// choose a JSON export to load, then returns the parsed file contents.
+export async function loadJsonFromDrive() {
+  ensureConfigured();
+  const file = await pickDriveFile("application/json");
+  if (!file) return null;
 
-  const res = await driveFetch(`files/${fileId}?alt=media`);
+  const res = await driveFetch(`files/${file.id}?alt=media`);
   if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
   return res.json();
+}
+
+// Native Google Workspace files have no raw bytes to download — they must
+// be exported to a plain format first.
+const GOOGLE_NATIVE_EXPORT_MIME = {
+  "application/vnd.google-apps.spreadsheet": "text/csv",
+  "application/vnd.google-apps.document": "text/plain",
+};
+
+const ROSTER_MIME_TYPES = ["text/csv", "text/plain", ...Object.keys(GOOGLE_NATIVE_EXPORT_MIME)].join(",");
+
+// Lets the teacher browse their Drive and pick a roster file (a Sheet,
+// Doc, CSV, or plain text list), returning { name, text }, or null if
+// they cancel. Caller is expected to parse `text` the same way it would
+// parse an uploaded file.
+export async function pickRosterFileFromDrive() {
+  ensureConfigured();
+  const file = await pickDriveFile(ROSTER_MIME_TYPES);
+  if (!file) return null;
+
+  const exportMime = GOOGLE_NATIVE_EXPORT_MIME[file.mimeType];
+  const res = await driveFetch(
+    exportMime ? `files/${file.id}/export?mimeType=${exportMime}` : `files/${file.id}?alt=media`
+  );
+  if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
+  return { name: file.name, text: await res.text() };
 }
