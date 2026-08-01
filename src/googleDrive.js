@@ -133,22 +133,26 @@ export async function saveJsonToDrive(filename, dataObj) {
   return res.json();
 }
 
-// Opens Google's file picker restricted to the given mime types and
-// resolves with the picked doc's { id, name, mimeType }, or null if the
-// teacher cancels. Includes both "My Drive" and "Shared with me" tabs —
-// a plain DocsView only browses My Drive, so files someone else shared
-// with the teacher wouldn't otherwise show up.
-async function pickDriveFile(mimeTypes) {
+// Opens Google's file picker and resolves with the picked doc's
+// { id, name, mimeType }, or null if the teacher cancels. Includes both
+// "My Drive" and "Shared with me" tabs — a plain DocsView only browses
+// My Drive, so files someone else shared with the teacher wouldn't
+// otherwise show up.
+//
+// Deliberately does NOT filter by mimeType here: Picker's per-folder
+// listing can come back empty when a mimeType filter is combined with
+// folder navigation (a file that's clearly there stops showing up once
+// you open its folder), so instead every file type is shown and the
+// caller validates the mimeType after the teacher picks something.
+async function pickDriveFile() {
   const token = await getAccessToken();
   await ensureGapiPicker();
 
   return new Promise((resolve) => {
     const myDriveView = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS)
-      .setMimeTypes(mimeTypes)
       .setIncludeFolders(true)
       .setLabel("My Drive");
     const sharedWithMeView = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS)
-      .setMimeTypes(mimeTypes)
       .setIncludeFolders(true)
       .setOwnedByMe(false)
       .setLabel("Shared with me");
@@ -174,8 +178,11 @@ async function pickDriveFile(mimeTypes) {
 // choose a JSON export to load, then returns the parsed file contents.
 export async function loadJsonFromDrive() {
   ensureConfigured();
-  const file = await pickDriveFile("application/json");
+  const file = await pickDriveFile();
   if (!file) return null;
+  if (file.mimeType !== "application/json") {
+    throw new Error(`"${file.name}" isn't a JSON file — pick a document previously saved with "Save to Drive".`);
+  }
 
   const res = await driveFetch(`files/${file.id}?alt=media`);
   if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
@@ -189,12 +196,12 @@ const GOOGLE_NATIVE_EXPORT_MIME = {
   "application/vnd.google-apps.document": "text/plain",
 };
 
-const ROSTER_MIME_TYPES = [
+const ROSTER_MIME_TYPES = new Set([
   "text/csv",
   "text/plain",
   "application/pdf",
   ...Object.keys(GOOGLE_NATIVE_EXPORT_MIME),
-].join(",");
+]);
 
 // Lets the teacher browse their Drive and pick a roster file (a Sheet,
 // Doc, CSV, plain text list, or PDF), returning { name, mimeType,
@@ -202,8 +209,11 @@ const ROSTER_MIME_TYPES = [
 // the bytes (plain text vs. PDF extraction) based on mimeType.
 export async function pickRosterFileFromDrive() {
   ensureConfigured();
-  const file = await pickDriveFile(ROSTER_MIME_TYPES);
+  const file = await pickDriveFile();
   if (!file) return null;
+  if (!ROSTER_MIME_TYPES.has(file.mimeType)) {
+    throw new Error(`"${file.name}" isn't a supported roster file — pick a Sheet, Doc, CSV, text, or PDF file.`);
+  }
 
   const exportMime = GOOGLE_NATIVE_EXPORT_MIME[file.mimeType];
   const res = await driveFetch(

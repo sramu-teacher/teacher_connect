@@ -42,7 +42,7 @@ function emptyStudent(name = "") {
 }
 
 // ---------- Periods ----------
-const PERIODS = ["Period 1", "Period 2", "Period 3", "Period 4", "Period 5", "Advisory"];
+const PERIODS = ["Period 1", "Period 2", "Period 3", "Period 4", "Period 5", "Period 6", "Advisory"];
 
 function defaultPeriodState() {
   return {
@@ -111,16 +111,42 @@ function parseRosterFile(text, filename = "") {
 
 // ---------- Parsing PDF rosters ----------
 // PDF text extraction reconstructs lines from text-item positions, not
-// real delimiters, so stray commas are common (dates, punctuation) and
-// would wrongly trigger parseRosterFile's CSV heuristic. Treat every
-// non-empty line as one name instead — teacher can clean up mis-splits
-// (multi-column layouts) inline afterward.
+// real delimiters, and roster PDFs commonly mix in headers/footers
+// (school name, period, dates, codes, column labels) alongside the
+// actual names. Filter those out with a few name-shaped heuristics
+// rather than treating every non-empty line as a student — still
+// best-effort (multi-column layouts can still misread), which is why
+// the caller prompts the teacher to review the imported roster after.
+const PDF_METADATA_KEYWORDS = [
+  "student name", "first name", "last name", "roster", "period", "school",
+  "grade", "teacher", "course", "section", "date", "page", "district",
+  "attendance", "advisory", "homeroom", "room", "campus", "printed",
+  "generated", "code", "class",
+];
+
+function looksLikeStudentName(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (/\d/.test(trimmed)) return false; // dates, IDs, codes, page numbers ("Period 3", "8/1/2026")
+  if (/[:@]/.test(trimmed)) return false; // "School: Lincoln High", emails
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false; // real names are ~2-4 words
+
+  const wordPattern = /^[A-Za-z][A-Za-z'-]*[,.]?$/;
+  if (!words.every((w) => wordPattern.test(w))) return false;
+
+  const lower = trimmed.toLowerCase();
+  if (PDF_METADATA_KEYWORDS.some((kw) => lower.includes(kw))) return false;
+
+  return true;
+}
+
 function parsePdfRosterText(text) {
   return text
     .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((name) => emptyStudent(name));
+    .filter(looksLikeStudentName)
+    .map((line) => emptyStudent(line.trim()));
 }
 
 // ---------- Seating algorithm ----------
