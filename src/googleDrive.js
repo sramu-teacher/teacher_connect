@@ -135,17 +135,27 @@ export async function saveJsonToDrive(filename, dataObj) {
 
 // Opens Google's file picker restricted to the given mime types and
 // resolves with the picked doc's { id, name, mimeType }, or null if the
-// teacher cancels.
+// teacher cancels. Includes both "My Drive" and "Shared with me" tabs —
+// a plain DocsView only browses My Drive, so files someone else shared
+// with the teacher wouldn't otherwise show up.
 async function pickDriveFile(mimeTypes) {
   const token = await getAccessToken();
   await ensureGapiPicker();
 
   return new Promise((resolve) => {
-    const view = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS)
+    const myDriveView = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS)
       .setMimeTypes(mimeTypes)
-      .setIncludeFolders(true);
+      .setIncludeFolders(true)
+      .setLabel("My Drive");
+    const sharedWithMeView = new window.google.picker.DocsView(window.google.picker.ViewId.DOCS)
+      .setMimeTypes(mimeTypes)
+      .setIncludeFolders(true)
+      .setOwnedByMe(false)
+      .setLabel("Shared with me");
     const picker = new window.google.picker.PickerBuilder()
-      .addView(view)
+      .addView(myDriveView)
+      .addView(sharedWithMeView)
+      .enableFeature(window.google.picker.Feature.SUPPORT_DRIVES)
       .setOAuthToken(token)
       .setDeveloperKey(API_KEY)
       .setCallback((data) => {
