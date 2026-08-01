@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
 import { Plus, X, Upload, Download, CloudUpload, CloudDownload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag } from "lucide-react";
 import { saveJsonToDrive, loadJsonFromDrive, pickRosterFileFromDrive } from "./googleDrive";
+import { extractTextFromPdf } from "./pdf";
 
 const DRIVE_FILENAME = "teacher_connect-seating-data.json";
 
@@ -106,6 +107,20 @@ function parseRosterFile(text, filename = "") {
   }
 
   return lines.map((name) => emptyStudent(name));
+}
+
+// ---------- Parsing PDF rosters ----------
+// PDF text extraction reconstructs lines from text-item positions, not
+// real delimiters, so stray commas are common (dates, punctuation) and
+// would wrongly trigger parseRosterFile's CSV heuristic. Treat every
+// non-empty line as one name instead — teacher can clean up mis-splits
+// (multi-column layouts) inline afterward.
+function parsePdfRosterText(text) {
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((name) => emptyStudent(name));
 }
 
 // ---------- Seating algorithm ----------
@@ -404,44 +419,58 @@ export default function SeatingChart() {
     showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} to ${activePeriod}.`);
   };
 
+  const addImportedStudents = (newStudents, sourceName, extraNote = "") => {
+    if (newStudents.length === 0) {
+      showToast(`Couldn't find any names in ${sourceName}.`, "clay");
+      return;
+    }
+    updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
+    showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} from ${sourceName} to ${activePeriod}.${extraNote}`);
+  };
+
   const handleRosterFile = (file) => {
     if (!file) return;
     const lowerName = file.name.toLowerCase();
-    if (lowerName.endsWith(".pdf")) {
-      showToast(
-        "This app can't read PDFs directly. Paste the PDF into the chat with Claude instead — Claude will pull out the names for you.",
-        "clay"
-      );
+    const isPdf = lowerName.endsWith(".pdf");
+    if (!isPdf && !lowerName.endsWith(".csv") && !lowerName.endsWith(".txt")) {
+      showToast("Please upload a .csv, .txt, or .pdf file of student names.", "clay");
       return;
     }
-    const isValidType = lowerName.endsWith(".csv") || lowerName.endsWith(".txt");
-    if (!isValidType) {
-      showToast("Please upload a .csv or .txt file of student names.", "clay");
-      return;
-    }
+
     const reader = new FileReader();
-    reader.onload = (evt) => {
-      const newStudents = parseRosterFile(evt.target.result, file.name);
-      if (newStudents.length === 0) {
-        showToast("Couldn't find any names in that file.", "clay");
-        return;
-      }
-      updatePeriod((p) => ({ students: [...p.students, ...newStudents] }));
-      showToast(`Added ${newStudents.length} student${newStudents.length > 1 ? "s" : ""} from ${file.name} to ${activePeriod}.`);
-    };
-    reader.readAsText(file);
+    if (isPdf) {
+      reader.onload = async (evt) => {
+        try {
+          const text = await extractTextFromPdf(evt.target.result);
+          addImportedStudents(
+            parsePdfRosterText(text),
+            file.name,
+            " PDF layout can affect accuracy — please review the roster."
+          );
+        } catch {
+          showToast("Couldn't read that PDF — it may be a scanned image rather than real text.", "clay");
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      reader.onload = (evt) => addImportedStudents(parseRosterFile(evt.target.result, file.name), file.name);
+      reader.readAsText(file);
+    }
   };
 
   // Opens Google's file picker so the teacher can choose a Sheet, Doc, CSV,
-  // or text roster from their own Drive; parsed the same way an uploaded
-  // file would be.
+  // text, or PDF roster from their own Drive; parsed the same way an
+  // uploaded file would be.
   const handleDriveImport = async () => {
     setDriveLoading(true);
     setDriveResult(null);
     try {
       const picked = await pickRosterFileFromDrive();
       if (!picked) return; // teacher cancelled the picker
-      const parsed = parseRosterFile(picked.text, picked.name);
+      const isPdf = picked.mimeType === "application/pdf";
+      const parsed = isPdf
+        ? parsePdfRosterText(await extractTextFromPdf(picked.arrayBuffer))
+        : parseRosterFile(new TextDecoder().decode(picked.arrayBuffer), picked.name);
       if (parsed.length === 0) {
         showToast(`Couldn't find any names in "${picked.name}".`, "clay");
         return;
@@ -883,7 +912,7 @@ function RosterView({
         <SummaryChip icon={<Ear size={13} />} label="Hearing" count={flagCounts.hearing} />
       </div>
 
-      {/* Upload zone — drop a CSV/TXT roster, or click to browse via native label-for-input */}
+      {/* Upload zone — drop a CSV/TXT/PDF roster, or click to browse via native label-for-input */}
       <label
         htmlFor="roster-file-input"
         onDragOver={(e) => {
@@ -915,15 +944,15 @@ function RosterView({
           Upload {activePeriod}'s roster
         </div>
         <div style={{ fontSize: 12.5, color: "#8A8272" }}>
-          Drop a .csv or .txt file here, or click to browse — one student per row
+          Drop a .csv, .txt, or .pdf file here, or click to browse — one student per row
           <br />
-          Have a PDF roster instead? Paste it into the chat with Claude and it'll extract the names for you.
+          PDF text is extracted automatically; scanned/image-only PDFs can't be read.
         </div>
         <input
           id="roster-file-input"
           ref={rosterFileInputRef}
           type="file"
-          accept=".csv,.txt,text/csv,text/plain"
+          accept=".csv,.txt,.pdf,text/csv,text/plain,application/pdf"
           onChange={(e) => {
             handleRosterFile(e.target.files?.[0]);
             e.target.value = "";
@@ -955,7 +984,7 @@ function RosterView({
           {driveLoading ? "Opening Drive…" : "Choose a roster file from Drive"}
         </button>
         <div className="sans" style={{ fontSize: 11.5, color: "#A89F8C", marginTop: 8 }}>
-          Opens Google's file picker so you can select a Sheet, Doc, CSV, or text roster from your Drive — names are pulled in the same way as an uploaded file, into {activePeriod}.
+          Opens Google's file picker so you can select a Sheet, Doc, CSV, text, or PDF roster from your Drive (including files others shared with you) — names are pulled in the same way as an uploaded file, into {activePeriod}.
         </div>
         {driveResult && (
           <div className="sans fade-in" style={{ fontSize: 12, color: T.sage, marginTop: 8, fontWeight: 600 }}>

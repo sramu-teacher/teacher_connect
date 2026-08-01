@@ -189,12 +189,17 @@ const GOOGLE_NATIVE_EXPORT_MIME = {
   "application/vnd.google-apps.document": "text/plain",
 };
 
-const ROSTER_MIME_TYPES = ["text/csv", "text/plain", ...Object.keys(GOOGLE_NATIVE_EXPORT_MIME)].join(",");
+const ROSTER_MIME_TYPES = [
+  "text/csv",
+  "text/plain",
+  "application/pdf",
+  ...Object.keys(GOOGLE_NATIVE_EXPORT_MIME),
+].join(",");
 
 // Lets the teacher browse their Drive and pick a roster file (a Sheet,
-// Doc, CSV, or plain text list), returning { name, text }, or null if
-// they cancel. Caller is expected to parse `text` the same way it would
-// parse an uploaded file.
+// Doc, CSV, plain text list, or PDF), returning { name, mimeType,
+// arrayBuffer }, or null if they cancel. Caller decides how to decode
+// the bytes (plain text vs. PDF extraction) based on mimeType.
 export async function pickRosterFileFromDrive() {
   ensureConfigured();
   const file = await pickDriveFile(ROSTER_MIME_TYPES);
@@ -205,5 +210,9 @@ export async function pickRosterFileFromDrive() {
     exportMime ? `files/${file.id}/export?mimeType=${exportMime}` : `files/${file.id}?alt=media`
   );
   if (!res.ok) throw new Error(`Drive download failed (${res.status})`);
-  return { name: file.name, text: await res.text() };
+  return {
+    name: file.name,
+    mimeType: exportMime || file.mimeType,
+    arrayBuffer: await res.arrayBuffer(),
+  };
 }
