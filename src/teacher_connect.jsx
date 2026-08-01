@@ -1,5 +1,8 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
-import { Plus, X, Upload, Download, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check } from "lucide-react";
+import { Plus, X, Upload, Download, CloudUpload, CloudDownload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check } from "lucide-react";
+import { saveJsonToDrive, loadJsonFromDrive } from "./googleDrive";
+
+const DRIVE_FILENAME = "teacher_connect-seating-data.json";
 
 // ---------- Design tokens ----------
 // Deep slate / warm paper / brass accent / sage-good / clay-conflict
@@ -260,6 +263,7 @@ export default function SeatingChart() {
   const [draggedStudent, setDraggedStudent] = useState(null);
   const [toast, setToast] = useState(null);
   const fileInputRef = useRef(null);
+  const [driveBusy, setDriveBusy] = useState(null); // "save" | "load" | null
 
   const seats = useMemo(() => {
     if (layoutType === "grid") return buildGrid(rows, cols);
@@ -354,9 +358,24 @@ export default function SeatingChart() {
     }
   };
 
+  const buildExportData = () => ({
+    students, layoutType, rows, cols, numPods, perPod, numPairs, pairCols, assignment,
+  });
+
+  const applyImportedData = (data) => {
+    if (data.students) setStudents(data.students);
+    if (data.layoutType) setLayoutType(data.layoutType);
+    if (data.rows) setRows(data.rows);
+    if (data.cols) setCols(data.cols);
+    if (data.numPods) setNumPods(data.numPods);
+    if (data.perPod) setPerPod(data.perPod);
+    if (data.numPairs) setNumPairs(data.numPairs);
+    if (data.pairCols) setPairCols(data.pairCols);
+    if (data.assignment) setAssignment(data.assignment);
+  };
+
   const handleExport = () => {
-    const data = { students, layoutType, rows, cols, numPods, perPod, numPairs, pairCols, assignment };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(buildExportData(), null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -371,22 +390,40 @@ export default function SeatingChart() {
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
-        const data = JSON.parse(evt.target.result);
-        if (data.students) setStudents(data.students);
-        if (data.layoutType) setLayoutType(data.layoutType);
-        if (data.rows) setRows(data.rows);
-        if (data.cols) setCols(data.cols);
-        if (data.numPods) setNumPods(data.numPods);
-        if (data.perPod) setPerPod(data.perPod);
-        if (data.numPairs) setNumPairs(data.numPairs);
-        if (data.pairCols) setPairCols(data.pairCols);
-        if (data.assignment) setAssignment(data.assignment);
+        applyImportedData(JSON.parse(evt.target.result));
         showToast("Roster and chart loaded from file.");
       } catch {
         showToast("Couldn't read that file — expecting a JSON export from this app.", "clay");
       }
     };
     reader.readAsText(file);
+  };
+
+  const handleSaveToDrive = async () => {
+    setDriveBusy("save");
+    try {
+      await saveJsonToDrive(DRIVE_FILENAME, buildExportData());
+      showToast("Roster and chart saved to Google Drive.");
+    } catch (err) {
+      showToast(err.message || "Couldn't save to Google Drive.", "clay");
+    } finally {
+      setDriveBusy(null);
+    }
+  };
+
+  const handleLoadFromDrive = async () => {
+    setDriveBusy("load");
+    try {
+      const data = await loadJsonFromDrive();
+      if (data) {
+        applyImportedData(data);
+        showToast("Roster and chart loaded from Google Drive.");
+      }
+    } catch (err) {
+      showToast(err.message || "Couldn't load from Google Drive.", "clay");
+    } finally {
+      setDriveBusy(null);
+    }
   };
 
   // manual drag-to-swap on chart
@@ -470,6 +507,22 @@ export default function SeatingChart() {
             <input ref={fileInputRef} type="file" accept="application/json" onChange={handleImport} style={{ display: "none" }} />
             <button onClick={handleExport} className="sans" style={btnGhost}>
               <Download size={15} /> Save
+            </button>
+            <button
+              onClick={handleLoadFromDrive}
+              disabled={driveBusy !== null}
+              className="sans"
+              style={{ ...btnGhost, opacity: driveBusy !== null ? 0.6 : 1 }}
+            >
+              <CloudDownload size={15} /> {driveBusy === "load" ? "Loading…" : "Load from Drive"}
+            </button>
+            <button
+              onClick={handleSaveToDrive}
+              disabled={driveBusy !== null}
+              className="sans"
+              style={{ ...btnGhost, opacity: driveBusy !== null ? 0.6 : 1 }}
+            >
+              <CloudUpload size={15} /> {driveBusy === "save" ? "Saving…" : "Save to Drive"}
             </button>
           </div>
         </div>
