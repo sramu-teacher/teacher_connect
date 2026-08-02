@@ -14,6 +14,7 @@ let gisLoaded = null;
 let gapiLoaded = null;
 let tokenClient = null;
 let accessToken = null;
+let pendingTokenRequest = null;
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -60,11 +61,14 @@ async function ensureGapiPicker() {
   await gapiLoaded;
 }
 
-// Resolves with a valid access token, prompting a Google sign-in
-// popup only when we don't already hold one.
-export function getAccessToken() {
-  ensureConfigured();
-  return new Promise((resolve, reject) => {
+// Requests a token with the given prompt mode, de-duping concurrent
+// callers onto a single in-flight request — without this, two things
+// asking for a token in the same tick (e.g. the sign-in click and the
+// Drive-sync effect that fires right after) could each decide "no
+// token yet" and independently pop an interactive consent screen.
+function requestToken(promptMode) {
+  if (pendingTokenRequest) return pendingTokenRequest;
+  pendingTokenRequest = new Promise((resolve, reject) => {
     ensureGis()
       .then(() => {
         if (!tokenClient) {
@@ -75,6 +79,7 @@ export function getAccessToken() {
           });
         }
         tokenClient.callback = (resp) => {
+          pendingTokenRequest = null;
           if (resp.error) {
             reject(new Error(resp.error));
             return;
@@ -82,10 +87,35 @@ export function getAccessToken() {
           accessToken = resp.access_token;
           resolve(accessToken);
         };
-        tokenClient.requestAccessToken({ prompt: accessToken ? "" : "consent" });
+        tokenClient.requestAccessToken({ prompt: promptMode });
       })
-      .catch(reject);
+      .catch((err) => {
+        pendingTokenRequest = null;
+        reject(err);
+      });
   });
+  return pendingTokenRequest;
+}
+
+// Resolves with a valid access token. Reuses one already held; only
+// asks Google for a new one *silently* (no visible prompt) otherwise —
+// this only succeeds if the browser still has an active Google session
+// with prior consent for these scopes. Callers that need to show the
+// interactive consent screen (the Sign In button) should call
+// requestInteractiveSignIn() instead.
+export function getAccessToken() {
+  ensureConfigured();
+  if (accessToken) return Promise.resolve(accessToken);
+  return requestToken("");
+}
+
+// Always shows Google's interactive consent screen — used only by the
+// explicit "Sign in with Google" button, including as a fallback when
+// a silent re-auth attempt (getAccessToken) fails.
+export function requestInteractiveSignIn() {
+  ensureConfigured();
+  accessToken = null;
+  return requestToken("consent");
 }
 
 // Fetches the signed-in teacher's Google profile (email, name, avatar)
@@ -105,6 +135,7 @@ export async function getUserProfile() {
 // requires fresh consent rather than silently reusing this one.
 export function signOut() {
   return new Promise((resolve) => {
+    pendingTokenRequest = null;
     if (!accessToken || !window.google?.accounts?.oauth2) {
       accessToken = null;
       tokenClient = null;
