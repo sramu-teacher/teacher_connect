@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect, lazy, Suspense } from "react";
 import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag, LogOut } from "lucide-react";
-import { exportRosterSheetToDrive, pickRosterFileFromDrive, loadAppStateFromDrive, saveAppStateToDrive } from "./googleDrive";
+import { exportRosterSheetToDrive, pickRosterFileFromDrive, loadAppStateFromDrive, saveAppStateToDrive, requestInteractiveSignIn } from "./googleDrive";
 import { extractTextFromPdf } from "./pdf";
 import { loadPersistedState, savePersistedState, LEGACY_STORAGE_KEY, userStorageKey } from "./localPersistence";
 import { parseRosterCsv, buildRosterCsv } from "./rosterCsv.js";
@@ -33,6 +33,12 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 // Behavior notes are now rich text (HTML); user-typed observation text
 // must be escaped before being spliced into it as a raw string.
 const escapeHtml = (str) => str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Distinguishes "the current token doesn't have Drive permission"
+// (401/403 — recoverable by re-consenting) from other failures like a
+// dropped connection, since only the former has a clear fix: prompt
+// the teacher to reconnect rather than leaving them stuck on "offline".
+const isAuthScopeError = (err) => /\(401\)|\(403\)/.test(err?.message || "");
 
 function emptyStudent(name = "") {
   return {
@@ -349,7 +355,7 @@ export default function SeatingChart({ user, onSignOut }) {
       : PERIODS[0]
   );
   const period = periods[activePeriod];
-  const [driveSyncStatus, setDriveSyncStatus] = useState("loading"); // "loading" | "synced" | "offline"
+  const [driveSyncStatus, setDriveSyncStatus] = useState("loading"); // "loading" | "synced" | "offline" | "reauth"
 
   // Mirrors state to this device's local cache (keyed per signed-in
   // teacher, so a shared classroom computer can't mix up two teachers'
@@ -366,11 +372,15 @@ export default function SeatingChart({ user, onSignOut }) {
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     saveTimeoutRef.current = setTimeout(() => {
       savePersistedState({ periods, activePeriod }, localKey);
-      saveAppStateToDrive({ periods, activePeriod }).catch(() => {
-        // Best-effort — a transient Drive save failure shouldn't block
-        // editing; the local cache already has the latest state and
-        // the next successful save catches Drive up.
-      });
+      saveAppStateToDrive({ periods, activePeriod })
+        .then(() => setDriveSyncStatus((s) => (s === "reauth" || s === "offline" ? "synced" : s)))
+        .catch((err) => {
+          // A transient network failure shouldn't interrupt editing —
+          // the local cache already has the latest state, and the next
+          // successful save catches Drive up. An auth-scope failure is
+          // different: it won't self-heal on retry, so surface it.
+          if (isAuthScopeError(err)) setDriveSyncStatus("reauth");
+        });
     }, 500);
     return () => clearTimeout(saveTimeoutRef.current);
   }, [periods, activePeriod, localKey, driveSyncStatus]);
@@ -770,8 +780,13 @@ export default function SeatingChart({ user, onSignOut }) {
         if (!cancelled) setDriveSyncStatus("synced");
       } catch (err) {
         if (!cancelled) {
-          setDriveSyncStatus("offline");
-          showToast(err.message || "Couldn't reach Google Drive — working from this device's local copy for now.", "clay");
+          if (isAuthScopeError(err)) {
+            setDriveSyncStatus("reauth");
+            showToast("Signed in, but Drive access wasn't granted — click \"Reconnect Drive\" to fix this.", "clay");
+          } else {
+            setDriveSyncStatus("offline");
+            showToast(err.message || "Couldn't reach Google Drive — working from this device's local copy for now.", "clay");
+          }
         }
       }
     })();
@@ -819,9 +834,30 @@ export default function SeatingChart({ user, onSignOut }) {
   // auto-saved shortly after every change) and confirms with a toast,
   // since a silent-only auto-save can leave a teacher unsure whether
   // her edits actually stuck.
-  const handleSaveNow = () => {
-    savePersistedState({ periods, activePeriod });
-    showToast("Saved.");
+  const handleSaveNow = async () => {
+    savePersistedState({ periods, activePeriod }, localKey);
+    try {
+      await saveAppStateToDrive({ periods, activePeriod });
+      setDriveSyncStatus((s) => (s === "reauth" || s === "offline" ? "synced" : s));
+      showToast("Saved.");
+    } catch (err) {
+      if (isAuthScopeError(err)) setDriveSyncStatus("reauth");
+      showToast(err.message || "Saved on this device, but couldn't reach Google Drive.", "clay");
+    }
+  };
+
+  // Re-requests interactive consent (a token that silently lost or
+  // never had Drive access can't fix itself) and retries a Drive save
+  // immediately so the teacher gets confirmation it actually worked.
+  const handleReconnectDrive = async () => {
+    try {
+      await requestInteractiveSignIn();
+      await saveAppStateToDrive({ periods, activePeriod });
+      setDriveSyncStatus("synced");
+      showToast("Reconnected to Google Drive.");
+    } catch (err) {
+      showToast(err.message || "Couldn't reconnect to Google Drive — please try again.", "clay");
+    }
   };
 
   const handleExportCsv = () => {
@@ -959,6 +995,16 @@ export default function SeatingChart({ user, onSignOut }) {
                 </span>
               )}
             </div>
+            {driveSyncStatus === "reauth" && (
+              <button
+                onClick={handleReconnectDrive}
+                className="sans"
+                title="Signed in, but Drive access wasn't granted — reconnect to enable saving to Drive"
+                style={{ ...btnGhost, color: T.clay, borderColor: T.clay }}
+              >
+                <CloudUpload size={14} /> Reconnect Drive
+              </button>
+            )}
             <button onClick={onSignOut} className="sans" style={btnGhost} aria-label="Sign out">
               <LogOut size={14} />
             </button>
