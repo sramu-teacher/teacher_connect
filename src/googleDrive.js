@@ -114,22 +114,20 @@ async function findFileIdByName(name) {
   return json.files?.[0]?.id ?? null;
 }
 
-// Creates the file on first save, updates it in place on later saves,
-// so repeated "Save to Drive" clicks don't pile up duplicate files.
-export async function saveJsonToDrive(filename, dataObj) {
+// Creates the file on first save, updates it in place on later saves, so
+// repeated saves don't pile up duplicate files.
+async function saveTextToDrive(filename, content, mimeType) {
   await getAccessToken();
   const existingId = await findFileIdByName(filename);
   const boundary = "teacher_connect_boundary";
-  const metadata = existingId
-    ? { name: filename }
-    : { name: filename, mimeType: "application/json" };
+  const metadata = existingId ? { name: filename } : { name: filename, mimeType };
   const body =
     `--${boundary}\r\n` +
     `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
     `${JSON.stringify(metadata)}\r\n` +
     `--${boundary}\r\n` +
-    `Content-Type: application/json\r\n\r\n` +
-    `${JSON.stringify(dataObj, null, 2)}\r\n` +
+    `Content-Type: ${mimeType}\r\n\r\n` +
+    `${content}\r\n` +
     `--${boundary}--`;
 
   const url = existingId
@@ -146,6 +144,10 @@ export async function saveJsonToDrive(filename, dataObj) {
   });
   await throwIfNotOk(res, "Drive save");
   return res.json();
+}
+
+export function saveCsvToDrive(filename, csvText) {
+  return saveTextToDrive(filename, csvText, "text/csv");
 }
 
 // Opens Google's file picker and resolves with the picked doc's
@@ -187,21 +189,6 @@ async function pickDriveFile() {
       .build();
     picker.setVisible(true);
   });
-}
-
-// Opens Google's file picker (scoped to the teacher's Drive) so they can
-// choose a JSON export to load, then returns the parsed file contents.
-export async function loadJsonFromDrive() {
-  ensureConfigured();
-  const file = await pickDriveFile();
-  if (!file) return null;
-  if (file.mimeType !== "application/json") {
-    throw new Error(`"${file.name}" isn't a JSON file — pick a document previously saved with "Save to Drive".`);
-  }
-
-  const res = await driveFetch(`files/${file.id}?alt=media`);
-  await throwIfNotOk(res, "Drive download");
-  return res.json();
 }
 
 // Native Google Workspace files have no raw bytes to download — they must
