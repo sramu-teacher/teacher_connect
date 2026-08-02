@@ -5,7 +5,10 @@
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
 const APP_ID = import.meta.env.VITE_GOOGLE_APP_ID;
-const SCOPE = "https://www.googleapis.com/auth/drive.file";
+// email/profile let us identify the signed-in teacher (for the account
+// system) without needing a separate ID-token sign-in flow — the same
+// access token used for Drive calls can also read the user's profile.
+const SCOPE = "https://www.googleapis.com/auth/drive.file email profile";
 
 let gisLoaded = null;
 let gapiLoaded = null;
@@ -82,6 +85,37 @@ export function getAccessToken() {
         tokenClient.requestAccessToken({ prompt: accessToken ? "" : "consent" });
       })
       .catch(reject);
+  });
+}
+
+// Fetches the signed-in teacher's Google profile (email, name, avatar)
+// using the same access token already granted for Drive access — this
+// is what "who's logged in" is based on, no separate identity API.
+export async function getUserProfile() {
+  const token = await getAccessToken();
+  const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Couldn't fetch profile (${res.status})`);
+  const data = await res.json();
+  return { email: data.email, name: data.name, picture: data.picture };
+}
+
+// Ends the session: revokes the access token so a future sign-in
+// requires fresh consent rather than silently reusing this one.
+export function signOut() {
+  return new Promise((resolve) => {
+    if (!accessToken || !window.google?.accounts?.oauth2) {
+      accessToken = null;
+      tokenClient = null;
+      resolve();
+      return;
+    }
+    window.google.accounts.oauth2.revoke(accessToken, () => {
+      accessToken = null;
+      tokenClient = null;
+      resolve();
+    });
   });
 }
 
@@ -190,6 +224,26 @@ export async function exportRosterSheetToDrive(filename, csvText) {
   const file = await saveTextToDrive(filename, csvText, "text/csv", "application/vnd.google-apps.spreadsheet");
   await applyWrapFormatting(file.id);
   return file;
+}
+
+const APP_STATE_FILENAME = "teacher_connect-app-state.json";
+
+// Full-fidelity auto-sync used by the sign-in flow: every period's
+// roster, room layout, seat assignments, and notes, saved to a fixed
+// file in the signed-in teacher's own Drive so it follows them across
+// devices. Distinct from exportRosterSheetToDrive (a human-readable
+// Sheet meant for sharing/reviewing, not for round-tripping state).
+export function saveAppStateToDrive(dataObj) {
+  return saveTextToDrive(APP_STATE_FILENAME, JSON.stringify(dataObj), "application/json");
+}
+
+export async function loadAppStateFromDrive() {
+  await getAccessToken();
+  const id = await findFileIdByName(APP_STATE_FILENAME);
+  if (!id) return null;
+  const res = await driveFetch(`files/${id}?alt=media`);
+  await throwIfNotOk(res, "Drive state load");
+  return res.json();
 }
 
 // Opens Google's file picker and resolves with the picked doc's
