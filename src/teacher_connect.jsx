@@ -1,9 +1,15 @@
-import React, { useState, useMemo, useCallback, useRef } from "react";
-import { Plus, X, Upload, Download, CloudUpload, CloudDownload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag } from "lucide-react";
-import { saveJsonToDrive, loadJsonFromDrive, pickRosterFileFromDrive } from "./googleDrive";
+import React, { useState, useMemo, useCallback, useRef, useEffect, lazy, Suspense } from "react";
+import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag } from "lucide-react";
+import { exportRosterSheetToDrive, pickRosterFileFromDrive } from "./googleDrive";
 import { extractTextFromPdf } from "./pdf";
+import { loadPersistedState, savePersistedState } from "./localPersistence";
+import { parseRosterCsv, buildRosterCsv } from "./rosterCsv.js";
 
-const DRIVE_FILENAME = "teacher_connect-seating-data.json";
+const DRIVE_SHEET_FILENAME = "Teacher Connect Roster";
+
+// Tiptap adds real bundle weight, so it's only fetched the first time a
+// student card is actually expanded, not on initial page load.
+const RichTextEditor = lazy(() => import("./RichTextEditor.jsx"));
 
 // ---------- Design tokens ----------
 // Deep slate / warm paper / brass accent / sage-good / clay-conflict
@@ -23,6 +29,10 @@ const T = {
 };
 
 const uid = () => Math.random().toString(36).slice(2, 10);
+
+// Behavior notes are now rich text (HTML); user-typed observation text
+// must be escaped before being spliced into it as a raw string.
+const escapeHtml = (str) => str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 function emptyStudent(name = "") {
   return {
@@ -326,11 +336,31 @@ function buildPairs(numPairs, cols) {
 
 // ---------- Main App ----------
 export default function SeatingChart() {
-  const [periods, setPeriods] = useState(() =>
-    Object.fromEntries(PERIODS.map((p) => [p, defaultPeriodState()]))
+  const persistedRef = useRef(loadPersistedState());
+
+  const [periods, setPeriods] = useState(() => {
+    const persistedPeriods = persistedRef.current?.periods;
+    return Object.fromEntries(PERIODS.map((p) => [p, persistedPeriods?.[p] || defaultPeriodState()]));
+  });
+  const [activePeriod, setActivePeriod] = useState(() =>
+    persistedRef.current?.activePeriod && PERIODS.includes(persistedRef.current.activePeriod)
+      ? persistedRef.current.activePeriod
+      : PERIODS[0]
   );
-  const [activePeriod, setActivePeriod] = useState(PERIODS[0]);
   const period = periods[activePeriod];
+
+  // Keeps a refresh (or an accidental tab close) from wiping unsaved
+  // work — everything is mirrored to localStorage shortly after each
+  // change. This is local-only persistence, not a backup; see the
+  // "Advanced backup" panel for durable export.
+  const saveTimeoutRef = useRef(null);
+  useEffect(() => {
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    saveTimeoutRef.current = setTimeout(() => {
+      savePersistedState({ periods, activePeriod });
+    }, 500);
+    return () => clearTimeout(saveTimeoutRef.current);
+  }, [periods, activePeriod]);
 
   const [activeTab, setActiveTab] = useState("roster"); // roster | chart
   const [expandedStudentId, setExpandedStudentId] = useState(null);
@@ -341,9 +371,21 @@ export default function SeatingChart() {
   const [rosterDragOver, setRosterDragOver] = useState(false);
   const [driveLoading, setDriveLoading] = useState(false);
   const [driveResult, setDriveResult] = useState(null);
-  const [driveBusy, setDriveBusy] = useState(null); // "save" | "load" | null
+  const [driveBusy, setDriveBusy] = useState(null); // "save" | null
+  const [saveMenuOpen, setSaveMenuOpen] = useState(false);
+  const [showBackupPanel, setShowBackupPanel] = useState(false);
   const fileInputRef = useRef(null);
   const rosterFileInputRef = useRef(null);
+  const saveMenuRef = useRef(null);
+
+  useEffect(() => {
+    if (!saveMenuOpen) return;
+    const handleClickOutside = (e) => {
+      if (saveMenuRef.current && !saveMenuRef.current.contains(e.target)) setSaveMenuOpen(false);
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [saveMenuOpen]);
 
   // Update the active period's slice immutably. Accepts an object patch or a fn(prevPeriod) => patch
   const updatePeriod = useCallback(
@@ -433,9 +475,8 @@ export default function SeatingChart() {
       students: p.students.map((s) => {
         if (s.id !== studentId) return s;
         const nextLog = [entry, ...s.observationLog];
-        const nextBehavior = flagged
-          ? (s.behaviorNotes ? `${s.behaviorNotes}\n[${entry.date}] ${entry.text}` : `[${entry.date}] ${entry.text}`)
-          : s.behaviorNotes;
+        const entryHtml = `<p><strong>[${entry.date}]</strong> ${escapeHtml(entry.text)}</p>`;
+        const nextBehavior = flagged ? `${s.behaviorNotes}${entryHtml}` : s.behaviorNotes;
         return { ...s, observationLog: nextLog, behaviorNotes: nextBehavior };
       }),
     }));
@@ -488,11 +529,109 @@ export default function SeatingChart() {
     return { added: newStudents.length, duplicates };
   };
 
+  // Merges parsed CSV rows into their target periods. If the CSV has a
+  // Period column (our own multi-period export), each row is routed to
+  // the matching period regardless of which tab is currently open;
+  // otherwise every row targets the currently active period, matching
+  // the plain-name-list behavior. Existing students (matched by name,
+  // case-insensitive) are left untouched — only new names are added —
+  // and friends/avoid name references are resolved against the full
+  // (existing + newly added) roster of each affected period.
+  const importRosterRows = (rows, hasPeriodColumn) => {
+    if (rows.length === 0) return { totalAdded: 0, totalDuplicates: 0, skippedPeriods: [] };
+
+    const groups = {};
+    const skippedPeriods = new Set();
+    for (const row of rows) {
+      let targetPeriod = activePeriod;
+      if (hasPeriodColumn) {
+        const match = PERIODS.find((p) => p.toLowerCase() === (row.period || "").toLowerCase());
+        if (!match) {
+          if (row.period) skippedPeriods.add(row.period);
+          continue;
+        }
+        targetPeriod = match;
+      }
+      (groups[targetPeriod] ||= []).push(row);
+    }
+
+    let totalAdded = 0;
+    let totalDuplicates = 0;
+
+    setPeriods((prev) => {
+      const next = { ...prev };
+      for (const [periodName, periodRows] of Object.entries(groups)) {
+        const existing = next[periodName] || defaultPeriodState();
+        const existingNames = new Set(existing.students.map((s) => s.name.trim().toLowerCase()));
+        const newStudents = [];
+        for (const row of periodRows) {
+          const key = row.name.trim().toLowerCase();
+          if (existingNames.has(key)) {
+            totalDuplicates++;
+            continue;
+          }
+          const s = emptyStudent(row.name);
+          if (row.academicLevel) s.academicLevel = row.academicLevel;
+          if (row.el !== undefined) s.el = row.el;
+          if (row.elLevel) s.elLevel = row.elLevel;
+          if (row.vision !== undefined) s.vision = row.vision;
+          if (row.hearing !== undefined) s.hearing = row.hearing;
+          if (row.iep) s.iep = row.iep;
+          if (row.behaviorNotes) s.behaviorNotes = row.behaviorNotes;
+          s._pendingFriendNames = row.friendNames || [];
+          s._pendingAvoidNames = row.avoidNames || [];
+          newStudents.push(s);
+          existingNames.add(key);
+        }
+        totalAdded += newStudents.length;
+        const mergedStudents = [...existing.students, ...newStudents];
+
+        const idByName = Object.fromEntries(mergedStudents.map((s) => [s.name.trim().toLowerCase(), s.id]));
+        const resolvedStudents = mergedStudents.map((s) => {
+          if (!s._pendingFriendNames && !s._pendingAvoidNames) return s;
+          const resolvedFriends = (s._pendingFriendNames || [])
+            .map((n) => idByName[n.trim().toLowerCase()])
+            .filter(Boolean);
+          const resolvedAvoid = (s._pendingAvoidNames || [])
+            .map((n) => idByName[n.trim().toLowerCase()])
+            .filter(Boolean);
+          const { _pendingFriendNames, _pendingAvoidNames, ...rest } = s;
+          return {
+            ...rest,
+            friends: [...new Set([...rest.friends, ...resolvedFriends])],
+            avoid: [...new Set([...rest.avoid, ...resolvedAvoid])],
+          };
+        });
+
+        next[periodName] = { ...existing, students: resolvedStudents };
+      }
+      return next;
+    });
+
+    return { totalAdded, totalDuplicates, skippedPeriods: [...skippedPeriods] };
+  };
+
+  const reportRosterImport = ({ totalAdded, totalDuplicates, skippedPeriods }, sourceName) => {
+    if (totalAdded === 0 && totalDuplicates === 0 && skippedPeriods.length === 0) {
+      showToast(`Couldn't find any names in ${sourceName}.`, "clay");
+      return;
+    }
+    const parts = [`Added ${totalAdded} new student${totalAdded !== 1 ? "s" : ""} from ${sourceName}.`];
+    if (totalDuplicates > 0) {
+      parts.push(`${totalDuplicates} already on the roster ${totalDuplicates > 1 ? "were" : "was"} left unchanged.`);
+    }
+    if (skippedPeriods.length > 0) {
+      parts.push(`Skipped rows for unrecognized period${skippedPeriods.length > 1 ? "s" : ""}: ${skippedPeriods.join(", ")}.`);
+    }
+    showToast(parts.join(" "), totalAdded > 0 ? "sage" : "clay");
+  };
+
   const handleRosterFile = (file) => {
     if (!file) return;
     const lowerName = file.name.toLowerCase();
     const isPdf = lowerName.endsWith(".pdf");
-    if (!isPdf && !lowerName.endsWith(".csv") && !lowerName.endsWith(".txt")) {
+    const isCsv = lowerName.endsWith(".csv");
+    if (!isPdf && !isCsv && !lowerName.endsWith(".txt")) {
       showToast("Please upload a .csv, .txt, or .pdf file of student names.", "clay");
       return;
     }
@@ -512,6 +651,12 @@ export default function SeatingChart() {
         }
       };
       reader.readAsArrayBuffer(file);
+    } else if (isCsv) {
+      reader.onload = (evt) => {
+        const { rows, hasPeriodColumn } = parseRosterCsv(evt.target.result);
+        reportRosterImport(importRosterRows(rows, hasPeriodColumn), file.name);
+      };
+      reader.readAsText(file);
     } else {
       reader.onload = (evt) => addImportedStudents(parseRosterFile(evt.target.result, file.name), file.name);
       reader.readAsText(file);
@@ -527,16 +672,26 @@ export default function SeatingChart() {
     try {
       const picked = await pickRosterFileFromDrive();
       if (!picked) return; // teacher cancelled the picker
-      const isPdf = picked.mimeType === "application/pdf";
-      const parsed = isPdf
-        ? parsePdfRosterText(await extractTextFromPdf(picked.arrayBuffer))
-        : parseRosterFile(new TextDecoder().decode(picked.arrayBuffer), picked.name);
-      const { added, duplicates } = addImportedStudents(
-        parsed,
-        `"${picked.name}"`,
-        isPdf ? " PDF layout can affect accuracy — please review the roster." : ""
-      );
-      setDriveResult({ fileName: picked.name, count: added, duplicates });
+
+      if (picked.mimeType === "application/pdf") {
+        const text = await extractTextFromPdf(picked.arrayBuffer);
+        const { added, duplicates } = addImportedStudents(
+          parsePdfRosterText(text),
+          `"${picked.name}"`,
+          " PDF layout can affect accuracy — please review the roster."
+        );
+        setDriveResult({ fileName: picked.name, count: added, duplicates });
+      } else if (picked.mimeType === "text/csv") {
+        const text = new TextDecoder().decode(picked.arrayBuffer);
+        const { rows, hasPeriodColumn } = parseRosterCsv(text);
+        const summary = importRosterRows(rows, hasPeriodColumn);
+        reportRosterImport(summary, `"${picked.name}"`);
+        setDriveResult({ fileName: picked.name, count: summary.totalAdded, duplicates: summary.totalDuplicates });
+      } else {
+        const text = new TextDecoder().decode(picked.arrayBuffer);
+        const { added, duplicates } = addImportedStudents(parseRosterFile(text, picked.name), `"${picked.name}"`);
+        setDriveResult({ fileName: picked.name, count: added, duplicates });
+      }
     } catch (err) {
       showToast(err.message || "Couldn't import from Drive — try again.", "clay");
     } finally {
@@ -576,55 +731,69 @@ export default function SeatingChart() {
     if (data.activePeriod && PERIODS.includes(data.activePeriod)) setActivePeriod(data.activePeriod);
   };
 
-  const handleExport = () => {
+  // Full-fidelity JSON backup (every period's roster, room layout, seat
+  // assignments, and notes) — the only format that can hold seating
+  // charts, since CSV is roster-only. Tucked into "Advanced backup"
+  // rather than a prominent button: day-to-day persistence is automatic
+  // (localStorage) or via the CSV export, this is the durable/portable
+  // fallback if local storage is ever lost.
+  const handleBackupExport = () => {
     const blob = new Blob([JSON.stringify(buildExportData(), null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `seating-chart-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `teacher_connect-backup-${new Date().toISOString().slice(0, 10)}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
-  const handleImport = (e) => {
+  const handleBackupImport = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
         applyImportedData(JSON.parse(evt.target.result));
-        showToast("Document loaded — all periods restored.");
+        showToast("Full backup restored — all periods, room layouts, and seating charts.");
       } catch {
-        showToast("Couldn't read that file — expecting a JSON export from this app.", "clay");
+        showToast("Couldn't read that file — expecting a backup previously downloaded from this app.", "clay");
       }
     };
     reader.readAsText(file);
+    e.target.value = "";
   };
 
-  const handleSaveToDrive = async () => {
+  // Explicit save button: writes immediately (the same state is also
+  // auto-saved shortly after every change) and confirms with a toast,
+  // since a silent-only auto-save can leave a teacher unsure whether
+  // her edits actually stuck.
+  const handleSaveNow = () => {
+    savePersistedState({ periods, activePeriod });
+    showToast("Saved.");
+  };
+
+  const handleExportCsv = () => {
+    const csv = buildRosterCsv(periods, PERIODS);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `teacher_connect-roster-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportCsvToDrive = async () => {
     setDriveBusy("save");
     try {
-      await saveJsonToDrive(DRIVE_FILENAME, buildExportData());
-      showToast("All periods saved to Google Drive.");
+      await exportRosterSheetToDrive(DRIVE_SHEET_FILENAME, buildRosterCsv(periods, PERIODS));
+      showToast("Roster exported to Google Drive as a Sheet.");
     } catch (err) {
-      showToast(err.message || "Couldn't save to Google Drive.", "clay");
-    } finally {
-      setDriveBusy(null);
-    }
-  };
-
-  const handleLoadFromDrive = async () => {
-    setDriveBusy("load");
-    try {
-      const data = await loadJsonFromDrive();
-      if (data) {
-        applyImportedData(data);
-        showToast("Document loaded from Google Drive.");
-      }
-    } catch (err) {
-      showToast(err.message || "Couldn't load from Google Drive.", "clay");
+      showToast(err.message || "Couldn't export to Google Drive.", "clay");
     } finally {
       setDriveBusy(null);
     }
@@ -681,6 +850,12 @@ export default function SeatingChart() {
         .tab-active::after { transform: scaleX(1); }
         input[type="checkbox"] { accent-color: ${T.brass}; }
         .chip { transition: all 0.15s ease; }
+        .rte-content .ProseMirror { padding: 8px 10px; font-size: 13px; color: ${T.ink}; min-height: 60px; outline: none; }
+        .rte-content .ProseMirror p { margin: 0 0 6px; }
+        .rte-content .ProseMirror ul { margin: 0 0 6px; padding-left: 20px; }
+        .rte-content .ProseMirror p.is-editor-empty:first-child::before {
+          content: attr(data-placeholder); float: left; height: 0; pointer-events: none; color: #A89F8C;
+        }
         @media (prefers-reduced-motion: reduce) {
           .seat, .fade-in, .chip { animation: none !important; transition: none !important; }
         }
@@ -698,38 +873,106 @@ export default function SeatingChart() {
             </h1>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <label htmlFor="load-json-input" className="sans" style={{ ...btnGhost, margin: 0 }}>
-              <Upload size={15} /> Load
+            <div ref={saveMenuRef} style={{ position: "relative", display: "flex" }}>
+              <button
+                onClick={handleSaveNow}
+                className="sans"
+                style={{ ...btnGhost, borderTopRightRadius: 0, borderBottomRightRadius: 0, borderRight: "none" }}
+              >
+                <Download size={15} /> Save
+              </button>
+              <button
+                onClick={() => setSaveMenuOpen((v) => !v)}
+                aria-label="More save options"
+                className="sans"
+                style={{ ...btnGhost, borderTopLeftRadius: 0, borderBottomLeftRadius: 0, padding: "8px 9px" }}
+              >
+                <ChevronDown size={13} />
+              </button>
+              {saveMenuOpen && (
+                <div
+                  className="fade-in"
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 6px)",
+                    right: 0,
+                    background: T.paper,
+                    border: `1px solid ${T.line}`,
+                    borderRadius: 9,
+                    boxShadow: "0 10px 28px rgba(0,0,0,0.14)",
+                    zIndex: 30,
+                    minWidth: 210,
+                    overflow: "hidden",
+                  }}
+                >
+                  <button
+                    onClick={() => {
+                      handleExportCsv();
+                      setSaveMenuOpen(false);
+                    }}
+                    className="sans"
+                    style={saveMenuItemStyle}
+                  >
+                    <Download size={14} /> Export as CSV
+                  </button>
+                  <button
+                    onClick={() => {
+                      handleExportCsvToDrive();
+                      setSaveMenuOpen(false);
+                    }}
+                    disabled={driveBusy !== null}
+                    className="sans"
+                    style={{ ...saveMenuItemStyle, opacity: driveBusy !== null ? 0.6 : 1 }}
+                  >
+                    <CloudUpload size={14} /> {driveBusy === "save" ? "Exporting…" : "Export to Drive"}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "4px 24px 0", display: "flex", justifyContent: "flex-end" }}>
+          <button
+            onClick={() => setShowBackupPanel((v) => !v)}
+            className="sans"
+            style={{ background: "none", border: "none", color: "#A89F8C", fontSize: 11, cursor: "pointer", padding: "2px 4px" }}
+          >
+            Advanced backup {showBackupPanel ? "▴" : "▾"}
+          </button>
+        </div>
+        {showBackupPanel && (
+          <div
+            className="fade-in"
+            style={{ maxWidth: 1180, margin: "0 auto", padding: "2px 24px 10px", display: "flex", gap: 16, justifyContent: "flex-end", alignItems: "center" }}
+          >
+            <span className="sans" style={{ fontSize: 11, color: "#A89F8C" }}>
+              Full backup includes room layouts &amp; seating charts (CSV export doesn't) —
+            </span>
+            <label
+              htmlFor="backup-restore-input"
+              className="sans"
+              style={{ fontSize: 11.5, color: T.graphite, textDecoration: "underline", cursor: "pointer" }}
+            >
+              Restore backup (.json)
             </label>
             <input
-              id="load-json-input"
+              id="backup-restore-input"
               ref={fileInputRef}
               type="file"
               accept=".json,application/json"
-              onChange={handleImport}
+              onChange={handleBackupImport}
               style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
             />
-            <button onClick={handleExport} className="sans" style={btnGhost}>
-              <Download size={15} /> Save
-            </button>
             <button
-              onClick={handleLoadFromDrive}
-              disabled={driveBusy !== null}
+              onClick={handleBackupExport}
               className="sans"
-              style={{ ...btnGhost, opacity: driveBusy !== null ? 0.6 : 1 }}
+              style={{ background: "none", border: "none", padding: 0, fontSize: 11.5, color: T.graphite, textDecoration: "underline", cursor: "pointer" }}
             >
-              <CloudDownload size={15} /> {driveBusy === "load" ? "Loading…" : "Load from Drive"}
-            </button>
-            <button
-              onClick={handleSaveToDrive}
-              disabled={driveBusy !== null}
-              className="sans"
-              style={{ ...btnGhost, opacity: driveBusy !== null ? 0.6 : 1 }}
-            >
-              <CloudUpload size={15} /> {driveBusy === "save" ? "Saving…" : "Save to Drive"}
+              Download backup (.json)
             </button>
           </div>
-        </div>
+        )}
 
         {/* Period tabs */}
         <div style={{ maxWidth: 1180, margin: "0 auto", padding: "16px 24px 0", display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -917,6 +1160,22 @@ const btnPrimary = {
   fontSize: 14,
   fontWeight: 700,
   color: T.paper,
+};
+
+const saveMenuItemStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  width: "100%",
+  background: "none",
+  border: "none",
+  borderBottom: `1px solid ${T.line}`,
+  padding: "10px 14px",
+  fontSize: 13,
+  fontWeight: 600,
+  color: T.graphite,
+  textAlign: "left",
+  cursor: "pointer",
 };
 
 // ================= Roster View =================
@@ -1321,12 +1580,13 @@ function StudentCard({ student, allStudents, updateStudent, showToast, removeStu
             </Field>
 
             <Field label="Behavior notes" full hint="also updated automatically by flagged observations below">
-              <textarea
-                value={student.behaviorNotes}
-                onChange={(e) => updateStudent(student.id, { behaviorNotes: e.target.value })}
-                placeholder="e.g., off-task when seated near peers, escalates with talkative neighbors..."
-                style={{ ...inputStyle, minHeight: 50, resize: "vertical" }}
-              />
+              <Suspense fallback={<div style={{ ...inputStyle, minHeight: 60, color: "#A89F8C" }}>Loading editor…</div>}>
+                <RichTextEditor
+                  value={student.behaviorNotes}
+                  onChange={(html) => updateStudent(student.id, { behaviorNotes: html })}
+                  placeholder="e.g., off-task when seated near peers, escalates with talkative neighbors..."
+                />
+              </Suspense>
             </Field>
 
             <Field label="Sensory">

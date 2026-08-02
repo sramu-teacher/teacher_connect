@@ -4,6 +4,7 @@
 
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
+const APP_ID = import.meta.env.VITE_GOOGLE_APP_ID;
 const SCOPE = "https://www.googleapis.com/auth/drive.file";
 
 let gisLoaded = null;
@@ -33,9 +34,9 @@ function loadScript(src) {
 }
 
 function ensureConfigured() {
-  if (!CLIENT_ID || !API_KEY) {
+  if (!CLIENT_ID || !API_KEY || !APP_ID) {
     throw new Error(
-      "Google Drive isn't configured — set VITE_GOOGLE_CLIENT_ID and VITE_GOOGLE_API_KEY in .env"
+      "Google Drive isn't configured — set VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_API_KEY, and VITE_GOOGLE_APP_ID in .env"
     );
   }
 }
@@ -114,22 +115,24 @@ async function findFileIdByName(name) {
   return json.files?.[0]?.id ?? null;
 }
 
-// Creates the file on first save, updates it in place on later saves,
-// so repeated "Save to Drive" clicks don't pile up duplicate files.
-export async function saveJsonToDrive(filename, dataObj) {
+// Creates the file on first save, updates it in place on later saves, so
+// repeated saves don't pile up duplicate files. `contentType` describes
+// the bytes being uploaded; `targetMimeType` (defaults to the same) is
+// what Drive stores the file as — passing a Google-native type here
+// (e.g. a Sheet) while uploading plain CSV bytes is exactly the signal
+// Drive uses to auto-convert the upload into that native format.
+async function saveTextToDrive(filename, content, contentType, targetMimeType = contentType) {
   await getAccessToken();
   const existingId = await findFileIdByName(filename);
   const boundary = "teacher_connect_boundary";
-  const metadata = existingId
-    ? { name: filename }
-    : { name: filename, mimeType: "application/json" };
+  const metadata = existingId ? { name: filename } : { name: filename, mimeType: targetMimeType };
   const body =
     `--${boundary}\r\n` +
     `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
     `${JSON.stringify(metadata)}\r\n` +
     `--${boundary}\r\n` +
-    `Content-Type: application/json\r\n\r\n` +
-    `${JSON.stringify(dataObj, null, 2)}\r\n` +
+    `Content-Type: ${contentType}\r\n\r\n` +
+    `${content}\r\n` +
     `--${boundary}--`;
 
   const url = existingId
@@ -146,6 +149,47 @@ export async function saveJsonToDrive(filename, dataObj) {
   });
   await throwIfNotOk(res, "Drive save");
   return res.json();
+}
+
+// Turns on wrap-text for every cell so long IEP/behavior-note content
+// is readable without the teacher manually resizing rows — Sheets
+// defaults to clipping/overflowing text instead. Looks up the actual
+// sheet ID rather than assuming 0, since that's not guaranteed.
+async function applyWrapFormatting(spreadsheetId) {
+  const metaRes = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties.sheetId`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  await throwIfNotOk(metaRes, "Sheet lookup");
+  const meta = await metaRes.json();
+  const sheetId = meta.sheets?.[0]?.properties?.sheetId ?? 0;
+
+  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requests: [
+        {
+          repeatCell: {
+            range: { sheetId },
+            cell: { userEnteredFormat: { wrapStrategy: "WRAP" } },
+            fields: "userEnteredFormat.wrapStrategy",
+          },
+        },
+      ],
+    }),
+  });
+  await throwIfNotOk(res, "Sheet formatting");
+}
+
+// Exports the roster as a real Google Sheet (not a plain CSV file) so
+// formatting persists — Drive auto-converts CSV bytes into a native
+// Sheet when the target mimeType is the Sheets type. Requires the
+// Google Sheets API to be enabled on the same Cloud project as Drive.
+export async function exportRosterSheetToDrive(filename, csvText) {
+  const file = await saveTextToDrive(filename, csvText, "text/csv", "application/vnd.google-apps.spreadsheet");
+  await applyWrapFormatting(file.id);
+  return file;
 }
 
 // Opens Google's file picker and resolves with the picked doc's
@@ -177,6 +221,7 @@ async function pickDriveFile() {
       .enableFeature(window.google.picker.Feature.SUPPORT_DRIVES)
       .setOAuthToken(token)
       .setDeveloperKey(API_KEY)
+      .setAppId(APP_ID)
       .setCallback((data) => {
         if (data.action === window.google.picker.Action.PICKED) {
           resolve(data.docs[0]);
@@ -187,21 +232,6 @@ async function pickDriveFile() {
       .build();
     picker.setVisible(true);
   });
-}
-
-// Opens Google's file picker (scoped to the teacher's Drive) so they can
-// choose a JSON export to load, then returns the parsed file contents.
-export async function loadJsonFromDrive() {
-  ensureConfigured();
-  const file = await pickDriveFile();
-  if (!file) return null;
-  if (file.mimeType !== "application/json") {
-    throw new Error(`"${file.name}" isn't a JSON file — pick a document previously saved with "Save to Drive".`);
-  }
-
-  const res = await driveFetch(`files/${file.id}?alt=media`);
-  await throwIfNotOk(res, "Drive download");
-  return res.json();
 }
 
 // Native Google Workspace files have no raw bytes to download — they must
