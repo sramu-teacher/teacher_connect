@@ -34,6 +34,27 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 // must be escaped before being spliced into it as a raw string.
 const escapeHtml = (str) => str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
+// Rich-text fields (iep, behaviorNotes) store HTML, not plain text — Tiptap
+// leaves an empty tag like "<p></p>" behind after the last character is
+// deleted, which is non-blank as a raw string even though there's nothing
+// to show. Strip tags before checking for real content.
+const hasTextContent = (html) => Boolean(html && html.replace(/<[^>]*>/g, "").trim());
+
+// One-time migration for data saved before "Has IEP" became its own
+// checkbox: back then the badge was derived from non-empty notes text,
+// so a student with real notes but no `hasIep` field yet (undefined,
+// not explicitly false) should keep showing the badge rather than
+// losing it the moment this ships.
+function migratePeriodStudents(periodState) {
+  if (!periodState?.students) return periodState;
+  return {
+    ...periodState,
+    students: periodState.students.map((s) =>
+      s.hasIep === undefined ? { ...s, hasIep: hasTextContent(s.iep) } : s
+    ),
+  };
+}
+
 // Distinguishes "the current token doesn't have Drive permission"
 // (401/403 — recoverable by re-consenting) from other failures like a
 // dropped connection, since only the former has a clear fix: prompt
@@ -44,6 +65,7 @@ function emptyStudent(name = "") {
   return {
     id: uid(),
     name,
+    hasIep: false,
     iep: "",
     el: false,
     elLevel: "",
@@ -240,8 +262,8 @@ function generateSeatingChart(students, seats, options) {
       }
       if (
         separateBehavior &&
-        student.behaviorNotes &&
-        neighborStudent.behaviorNotes
+        hasTextContent(student.behaviorNotes) &&
+        hasTextContent(neighborStudent.behaviorNotes)
       ) {
         score += 40;
       }
@@ -347,7 +369,7 @@ export default function SeatingChart({ user, onSignOut }) {
 
   const [periods, setPeriods] = useState(() => {
     const persistedPeriods = persistedRef.current?.periods;
-    return Object.fromEntries(PERIODS.map((p) => [p, persistedPeriods?.[p] || defaultPeriodState()]));
+    return Object.fromEntries(PERIODS.map((p) => [p, migratePeriodStudents(persistedPeriods?.[p] || defaultPeriodState())]));
   });
   const [activePeriod, setActivePeriod] = useState(() =>
     persistedRef.current?.activePeriod && PERIODS.includes(persistedRef.current.activePeriod)
@@ -599,6 +621,7 @@ export default function SeatingChart({ user, onSignOut }) {
           if (row.elLevel) s.elLevel = row.elLevel;
           if (row.vision !== undefined) s.vision = row.vision;
           if (row.hearing !== undefined) s.hearing = row.hearing;
+          if (row.hasIep !== undefined) s.hasIep = row.hasIep;
           if (row.iep) s.iep = row.iep;
           if (row.behaviorNotes) s.behaviorNotes = row.behaviorNotes;
           s._pendingFriendNames = row.friendNames || [];
@@ -748,7 +771,7 @@ export default function SeatingChart({ user, onSignOut }) {
   const applyImportedData = (data) => {
     if (data.periods) {
       // ensure every expected period key exists, migrate missing ones
-      const merged = Object.fromEntries(PERIODS.map((p) => [p, data.periods[p] || defaultPeriodState()]));
+      const merged = Object.fromEntries(PERIODS.map((p) => [p, migratePeriodStudents(data.periods[p] || defaultPeriodState())]));
       setPeriods(merged);
     }
     if (data.activePeriod && PERIODS.includes(data.activePeriod)) setActivePeriod(data.activePeriod);
@@ -903,9 +926,9 @@ export default function SeatingChart({ user, onSignOut }) {
   const studentById = Object.fromEntries(period.students.map((s) => [s.id, s]));
 
   const flagCounts = {
-    iep: period.students.filter((s) => s.iep.trim()).length,
+    iep: period.students.filter((s) => s.hasIep).length,
     el: period.students.filter((s) => s.el).length,
-    behavior: period.students.filter((s) => s.behaviorNotes.trim()).length,
+    behavior: period.students.filter((s) => hasTextContent(s.behaviorNotes)).length,
     vision: period.students.filter((s) => s.vision).length,
     hearing: period.students.filter((s) => s.hearing).length,
   };
@@ -1589,7 +1612,7 @@ function StudentCard({ student, allStudents, updateStudent, showToast, removeStu
       const stamp = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
       const uploadHtml = `<p><strong>Uploaded ${stamp} (${escapeHtml(file.name)}):</strong></p><p>${escapeHtml(text).replace(/\n/g, "<br>")}</p>`;
       const merged = student.iep ? `${student.iep}${uploadHtml}` : uploadHtml;
-      updateStudent(student.id, { iep: merged });
+      updateStudent(student.id, { iep: merged, hasIep: true });
       showToast(`IEP document added for ${student.name || "this student"}.`);
     } catch {
       showToast("Couldn't read that IEP document — it may be a scanned image rather than real text.", "clay");
@@ -1599,9 +1622,9 @@ function StudentCard({ student, allStudents, updateStudent, showToast, removeStu
   };
 
   const flags = [];
-  if (student.iep.trim()) flags.push({ icon: <FileText size={11} />, label: "IEP" });
+  if (student.hasIep) flags.push({ icon: <FileText size={11} />, label: "IEP" });
   if (student.el) flags.push({ icon: <Languages size={11} />, label: student.elLevel ? `EL · ${student.elLevel}` : "EL" });
-  if (student.behaviorNotes.trim()) flags.push({ icon: <AlertTriangle size={11} />, label: "Behavior" });
+  if (hasTextContent(student.behaviorNotes)) flags.push({ icon: <AlertTriangle size={11} />, label: "Behavior" });
   if (student.vision) flags.push({ icon: <Eye size={11} />, label: "Vision" });
   if (student.hearing) flags.push({ icon: <Ear size={11} />, label: "Hearing" });
 
@@ -1687,6 +1710,14 @@ function StudentCard({ student, allStudents, updateStudent, showToast, removeStu
             </Field>
 
             <Field label="IEP / 504 accommodations" full hint="upload a document to append its text below">
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={student.hasIep}
+                  onChange={(e) => updateStudent(student.id, { hasIep: e.target.checked })}
+                />
+                Has IEP / 504 plan
+              </label>
               <Suspense fallback={<div style={{ ...inputStyle, minHeight: 60, color: "#A89F8C" }}>Loading editor…</div>}>
                 <RichTextEditor
                   value={student.iep}
@@ -2113,9 +2144,9 @@ function SeatGrid({ layoutType, seats, assignment, studentById, draggedStudent, 
 
 function SeatCell({ seat, student, draggedStudent, setDraggedStudent, handleDrop, wide }) {
   const flagIcons = [];
-  if (student?.iep.trim()) flagIcons.push(<FileText key="iep" size={10} />);
+  if (student?.hasIep) flagIcons.push(<FileText key="iep" size={10} />);
   if (student?.el) flagIcons.push(<Languages key="el" size={10} />);
-  if (student?.behaviorNotes.trim()) flagIcons.push(<AlertTriangle key="beh" size={10} />);
+  if (hasTextContent(student?.behaviorNotes)) flagIcons.push(<AlertTriangle key="beh" size={10} />);
   if (student?.vision) flagIcons.push(<Eye key="vis" size={10} />);
   if (student?.hearing) flagIcons.push(<Ear key="hear" size={10} />);
 

@@ -5,7 +5,7 @@ compatibility_date = "2026-08-01"
 # Create with: wrangler kv namespace create RATE_LIMIT_KV
 # then paste the returned id below.
 kv_namespaces = [
-  { binding = "RATE_LIMIT_KV", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+  { binding = "RATE_LIMIT_KV", id = "d29cd0f2b2244a71b65bc36634fe41fd" }
 ]
 
 # Secret (not stored here): wrangler secret put ANTHROPIC_API_KEY
