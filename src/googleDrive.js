@@ -5,12 +5,16 @@
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
 const APP_ID = import.meta.env.VITE_GOOGLE_APP_ID;
-const SCOPE = "https://www.googleapis.com/auth/drive.file";
+// email/profile let us identify the signed-in teacher (for the account
+// system) without needing a separate ID-token sign-in flow — the same
+// access token used for Drive calls can also read the user's profile.
+const SCOPE = "https://www.googleapis.com/auth/drive.file email profile";
 
 let gisLoaded = null;
 let gapiLoaded = null;
 let tokenClient = null;
 let accessToken = null;
+let pendingTokenRequest = null;
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -57,11 +61,14 @@ async function ensureGapiPicker() {
   await gapiLoaded;
 }
 
-// Resolves with a valid access token, prompting a Google sign-in
-// popup only when we don't already hold one.
-export function getAccessToken() {
-  ensureConfigured();
-  return new Promise((resolve, reject) => {
+// Requests a token with the given prompt mode, de-duping concurrent
+// callers onto a single in-flight request — without this, two things
+// asking for a token in the same tick (e.g. the sign-in click and the
+// Drive-sync effect that fires right after) could each decide "no
+// token yet" and independently pop an interactive consent screen.
+function requestToken(promptMode) {
+  if (pendingTokenRequest) return pendingTokenRequest;
+  pendingTokenRequest = new Promise((resolve, reject) => {
     ensureGis()
       .then(() => {
         if (!tokenClient) {
@@ -72,6 +79,7 @@ export function getAccessToken() {
           });
         }
         tokenClient.callback = (resp) => {
+          pendingTokenRequest = null;
           if (resp.error) {
             reject(new Error(resp.error));
             return;
@@ -79,9 +87,66 @@ export function getAccessToken() {
           accessToken = resp.access_token;
           resolve(accessToken);
         };
-        tokenClient.requestAccessToken({ prompt: accessToken ? "" : "consent" });
+        tokenClient.requestAccessToken({ prompt: promptMode });
       })
-      .catch(reject);
+      .catch((err) => {
+        pendingTokenRequest = null;
+        reject(err);
+      });
+  });
+  return pendingTokenRequest;
+}
+
+// Resolves with a valid access token. Reuses one already held; only
+// asks Google for a new one *silently* (no visible prompt) otherwise —
+// this only succeeds if the browser still has an active Google session
+// with prior consent for these scopes. Callers that need to show the
+// interactive consent screen (the Sign In button) should call
+// requestInteractiveSignIn() instead.
+export function getAccessToken() {
+  ensureConfigured();
+  if (accessToken) return Promise.resolve(accessToken);
+  return requestToken("");
+}
+
+// Always shows Google's interactive consent screen — used only by the
+// explicit "Sign in with Google" button, including as a fallback when
+// a silent re-auth attempt (getAccessToken) fails.
+export function requestInteractiveSignIn() {
+  ensureConfigured();
+  accessToken = null;
+  return requestToken("consent");
+}
+
+// Fetches the signed-in teacher's Google profile (email, name, avatar)
+// using the same access token already granted for Drive access — this
+// is what "who's logged in" is based on, no separate identity API.
+export async function getUserProfile() {
+  const token = await getAccessToken();
+  const res = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Couldn't fetch profile (${res.status})`);
+  const data = await res.json();
+  return { email: data.email, name: data.name, picture: data.picture };
+}
+
+// Ends the session: revokes the access token so a future sign-in
+// requires fresh consent rather than silently reusing this one.
+export function signOut() {
+  return new Promise((resolve) => {
+    pendingTokenRequest = null;
+    if (!accessToken || !window.google?.accounts?.oauth2) {
+      accessToken = null;
+      tokenClient = null;
+      resolve();
+      return;
+    }
+    window.google.accounts.oauth2.revoke(accessToken, () => {
+      accessToken = null;
+      tokenClient = null;
+      resolve();
+    });
   });
 }
 
@@ -190,6 +255,26 @@ export async function exportRosterSheetToDrive(filename, csvText) {
   const file = await saveTextToDrive(filename, csvText, "text/csv", "application/vnd.google-apps.spreadsheet");
   await applyWrapFormatting(file.id);
   return file;
+}
+
+const APP_STATE_FILENAME = "teacher_connect-app-state.json";
+
+// Full-fidelity auto-sync used by the sign-in flow: every period's
+// roster, room layout, seat assignments, and notes, saved to a fixed
+// file in the signed-in teacher's own Drive so it follows them across
+// devices. Distinct from exportRosterSheetToDrive (a human-readable
+// Sheet meant for sharing/reviewing, not for round-tripping state).
+export function saveAppStateToDrive(dataObj) {
+  return saveTextToDrive(APP_STATE_FILENAME, JSON.stringify(dataObj), "application/json");
+}
+
+export async function loadAppStateFromDrive() {
+  await getAccessToken();
+  const id = await findFileIdByName(APP_STATE_FILENAME);
+  if (!id) return null;
+  const res = await driveFetch(`files/${id}?alt=media`);
+  await throwIfNotOk(res, "Drive state load");
+  return res.json();
 }
 
 // Opens Google's file picker and resolves with the picked doc's

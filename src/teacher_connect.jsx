@@ -1,8 +1,8 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect, lazy, Suspense } from "react";
-import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag } from "lucide-react";
-import { exportRosterSheetToDrive, pickRosterFileFromDrive } from "./googleDrive";
+import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag, LogOut } from "lucide-react";
+import { exportRosterSheetToDrive, pickRosterFileFromDrive, loadAppStateFromDrive, saveAppStateToDrive, requestInteractiveSignIn } from "./googleDrive";
 import { extractTextFromPdf } from "./pdf";
-import { loadPersistedState, savePersistedState } from "./localPersistence";
+import { loadPersistedState, savePersistedState, LEGACY_STORAGE_KEY, userStorageKey } from "./localPersistence";
 import { parseRosterCsv, buildRosterCsv } from "./rosterCsv.js";
 
 const DRIVE_SHEET_FILENAME = "Teacher Connect Roster";
@@ -33,6 +33,12 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 // Behavior notes are now rich text (HTML); user-typed observation text
 // must be escaped before being spliced into it as a raw string.
 const escapeHtml = (str) => str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Distinguishes "the current token doesn't have Drive permission"
+// (401/403 — recoverable by re-consenting) from other failures like a
+// dropped connection, since only the former has a clear fix: prompt
+// the teacher to reconnect rather than leaving them stuck on "offline".
+const isAuthScopeError = (err) => /\(401\)|\(403\)/.test(err?.message || "");
 
 function emptyStudent(name = "") {
   return {
@@ -335,8 +341,9 @@ function buildPairs(numPairs, cols) {
 }
 
 // ---------- Main App ----------
-export default function SeatingChart() {
-  const persistedRef = useRef(loadPersistedState());
+export default function SeatingChart({ user, onSignOut }) {
+  const localKey = userStorageKey(user.email);
+  const persistedRef = useRef(loadPersistedState(localKey));
 
   const [periods, setPeriods] = useState(() => {
     const persistedPeriods = persistedRef.current?.periods;
@@ -348,19 +355,35 @@ export default function SeatingChart() {
       : PERIODS[0]
   );
   const period = periods[activePeriod];
+  const [driveSyncStatus, setDriveSyncStatus] = useState("loading"); // "loading" | "synced" | "offline" | "reauth"
 
-  // Keeps a refresh (or an accidental tab close) from wiping unsaved
-  // work — everything is mirrored to localStorage shortly after each
-  // change. This is local-only persistence, not a backup; see the
-  // "Advanced backup" panel for durable export.
+  // Mirrors state to this device's local cache (keyed per signed-in
+  // teacher, so a shared classroom computer can't mix up two teachers'
+  // data) and to the teacher's Drive shortly after each change. Local
+  // cache keeps refreshes snappy without waiting on a network round
+  // trip; Drive is the cross-device source of truth.
   const saveTimeoutRef = useRef(null);
   useEffect(() => {
+    // Skip until the initial Drive sync below has resolved — saving
+    // here first would push this device's (possibly empty, possibly
+    // stale-local-cache) starting state to Drive and could clobber
+    // real data from another device before we've even read it.
+    if (driveSyncStatus === "loading") return;
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     saveTimeoutRef.current = setTimeout(() => {
-      savePersistedState({ periods, activePeriod });
+      savePersistedState({ periods, activePeriod }, localKey);
+      saveAppStateToDrive({ periods, activePeriod })
+        .then(() => setDriveSyncStatus((s) => (s === "reauth" || s === "offline" ? "synced" : s)))
+        .catch((err) => {
+          // A transient network failure shouldn't interrupt editing —
+          // the local cache already has the latest state, and the next
+          // successful save catches Drive up. An auth-scope failure is
+          // different: it won't self-heal on retry, so surface it.
+          if (isAuthScopeError(err)) setDriveSyncStatus("reauth");
+        });
     }, 500);
     return () => clearTimeout(saveTimeoutRef.current);
-  }, [periods, activePeriod]);
+  }, [periods, activePeriod, localKey, driveSyncStatus]);
 
   const [activeTab, setActiveTab] = useState("roster"); // roster | chart
   const [expandedStudentId, setExpandedStudentId] = useState(null);
@@ -731,6 +754,48 @@ export default function SeatingChart() {
     if (data.activePeriod && PERIODS.includes(data.activePeriod)) setActivePeriod(data.activePeriod);
   };
 
+  // On sign-in, pull the authoritative copy from Drive (the cross-device
+  // source of truth). If Drive has nothing yet and this browser still
+  // has data under the old pre-account storage key, adopt it as this
+  // teacher's starting data and push it up — a one-time migration so
+  // work from before accounts existed isn't stranded behind the new
+  // sign-in wall. Runs once per sign-in session (App.jsx mounts a fresh
+  // SeatingChart on each sign-in).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const remote = await loadAppStateFromDrive();
+        if (cancelled) return;
+        if (remote?.periods) {
+          applyImportedData(remote);
+        } else {
+          const legacy = loadPersistedState(LEGACY_STORAGE_KEY);
+          if (legacy?.periods) {
+            applyImportedData(legacy);
+            showToast("Found your previous data on this device — copied it to your account.");
+            await saveAppStateToDrive(legacy);
+          }
+        }
+        if (!cancelled) setDriveSyncStatus("synced");
+      } catch (err) {
+        if (!cancelled) {
+          if (isAuthScopeError(err)) {
+            setDriveSyncStatus("reauth");
+            showToast("Signed in, but Drive access wasn't granted — click \"Reconnect Drive\" to fix this.", "clay");
+          } else {
+            setDriveSyncStatus("offline");
+            showToast(err.message || "Couldn't reach Google Drive — working from this device's local copy for now.", "clay");
+          }
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Full-fidelity JSON backup (every period's roster, room layout, seat
   // assignments, and notes) — the only format that can hold seating
   // charts, since CSV is roster-only. Tucked into "Advanced backup"
@@ -769,9 +834,30 @@ export default function SeatingChart() {
   // auto-saved shortly after every change) and confirms with a toast,
   // since a silent-only auto-save can leave a teacher unsure whether
   // her edits actually stuck.
-  const handleSaveNow = () => {
-    savePersistedState({ periods, activePeriod });
-    showToast("Saved.");
+  const handleSaveNow = async () => {
+    savePersistedState({ periods, activePeriod }, localKey);
+    try {
+      await saveAppStateToDrive({ periods, activePeriod });
+      setDriveSyncStatus((s) => (s === "reauth" || s === "offline" ? "synced" : s));
+      showToast("Saved.");
+    } catch (err) {
+      if (isAuthScopeError(err)) setDriveSyncStatus("reauth");
+      showToast(err.message || "Saved on this device, but couldn't reach Google Drive.", "clay");
+    }
+  };
+
+  // Re-requests interactive consent (a token that silently lost or
+  // never had Drive access can't fix itself) and retries a Drive save
+  // immediately so the teacher gets confirmation it actually worked.
+  const handleReconnectDrive = async () => {
+    try {
+      await requestInteractiveSignIn();
+      await saveAppStateToDrive({ periods, activePeriod });
+      setDriveSyncStatus("synced");
+      showToast("Reconnected to Google Drive.");
+    } catch (err) {
+      showToast(err.message || "Couldn't reconnect to Google Drive — please try again.", "clay");
+    }
   };
 
   const handleExportCsv = () => {
@@ -873,6 +959,55 @@ export default function SeatingChart() {
             </h1>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div className="sans" style={{ display: "flex", alignItems: "center", gap: 8, marginRight: 4 }}>
+              {user.picture ? (
+                <img
+                  src={user.picture}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                  style={{ width: 26, height: 26, borderRadius: "50%" }}
+                />
+              ) : (
+                <div
+                  style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: "50%",
+                    background: T.brassSoft,
+                    color: "#7A5A18",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontSize: 11,
+                    fontWeight: 700,
+                  }}
+                >
+                  {(user.name || user.email || "?").charAt(0).toUpperCase()}
+                </div>
+              )}
+              <span style={{ fontSize: 12.5, color: T.graphite, fontWeight: 600 }}>{user.name || user.email}</span>
+              {driveSyncStatus === "offline" && (
+                <span
+                  title="Couldn't reach Google Drive — changes are only saved on this device for now"
+                  style={{ fontSize: 10.5, color: T.clay, fontWeight: 700 }}
+                >
+                  offline
+                </span>
+              )}
+            </div>
+            {driveSyncStatus === "reauth" && (
+              <button
+                onClick={handleReconnectDrive}
+                className="sans"
+                title="Signed in, but Drive access wasn't granted — reconnect to enable saving to Drive"
+                style={{ ...btnGhost, color: T.clay, borderColor: T.clay }}
+              >
+                <CloudUpload size={14} /> Reconnect Drive
+              </button>
+            )}
+            <button onClick={onSignOut} className="sans" style={btnGhost} aria-label="Sign out">
+              <LogOut size={14} />
+            </button>
             <div ref={saveMenuRef} style={{ position: "relative", display: "flex" }}>
               <button
                 onClick={handleSaveNow}
