@@ -1452,7 +1452,8 @@ function StudentCard({ student, allStudents, updateStudent, showToast, removeStu
         return;
       }
       const stamp = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-      const merged = student.iep ? `${student.iep}\n\n--- Uploaded ${stamp} (${file.name}) ---\n${text}` : text;
+      const uploadHtml = `<p><strong>Uploaded ${stamp} (${escapeHtml(file.name)}):</strong></p><p>${escapeHtml(text).replace(/\n/g, "<br>")}</p>`;
+      const merged = student.iep ? `${student.iep}${uploadHtml}` : uploadHtml;
       updateStudent(student.id, { iep: merged });
       showToast(`IEP document added for ${student.name || "this student"}.`);
     } catch {
@@ -1551,12 +1552,13 @@ function StudentCard({ student, allStudents, updateStudent, showToast, removeStu
             </Field>
 
             <Field label="IEP / 504 accommodations" full hint="upload a document to append its text below">
-              <textarea
-                value={student.iep}
-                onChange={(e) => updateStudent(student.id, { iep: e.target.value })}
-                placeholder="e.g., preferential seating near instruction, extended time, reduced distractions..."
-                style={{ ...inputStyle, minHeight: 60, resize: "vertical" }}
-              />
+              <Suspense fallback={<div style={{ ...inputStyle, minHeight: 60, color: "#A89F8C" }}>Loading editor…</div>}>
+                <RichTextEditor
+                  value={student.iep}
+                  onChange={(html) => updateStudent(student.id, { iep: html })}
+                  placeholder="e.g., preferential seating near instruction, extended time, reduced distractions..."
+                />
+              </Suspense>
               <div style={{ marginTop: 6, position: "relative" }}>
                 <label
                   htmlFor={`iep-file-${student.id}`}
