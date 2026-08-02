@@ -1,11 +1,11 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect, lazy, Suspense } from "react";
 import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag } from "lucide-react";
-import { saveCsvToDrive, pickRosterFileFromDrive } from "./googleDrive";
+import { exportRosterSheetToDrive, pickRosterFileFromDrive } from "./googleDrive";
 import { extractTextFromPdf } from "./pdf";
 import { loadPersistedState, savePersistedState } from "./localPersistence";
 import { parseRosterCsv, buildRosterCsv } from "./rosterCsv.js";
 
-const DRIVE_CSV_FILENAME = "teacher_connect-roster.csv";
+const DRIVE_SHEET_FILENAME = "Teacher Connect Roster";
 
 // Tiptap adds real bundle weight, so it's only fetched the first time a
 // student card is actually expanded, not on initial page load.
@@ -790,8 +790,8 @@ export default function SeatingChart() {
   const handleExportCsvToDrive = async () => {
     setDriveBusy("save");
     try {
-      await saveCsvToDrive(DRIVE_CSV_FILENAME, buildRosterCsv(periods, PERIODS));
-      showToast("Roster exported to Google Drive.");
+      await exportRosterSheetToDrive(DRIVE_SHEET_FILENAME, buildRosterCsv(periods, PERIODS));
+      showToast("Roster exported to Google Drive as a Sheet.");
     } catch (err) {
       showToast(err.message || "Couldn't export to Google Drive.", "clay");
     } finally {
