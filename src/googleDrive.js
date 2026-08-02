@@ -4,6 +4,7 @@
 
 const CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
+const APP_ID = import.meta.env.VITE_GOOGLE_APP_ID;
 const SCOPE = "https://www.googleapis.com/auth/drive.file";
 
 let gisLoaded = null;
@@ -33,9 +34,9 @@ function loadScript(src) {
 }
 
 function ensureConfigured() {
-  if (!CLIENT_ID || !API_KEY) {
+  if (!CLIENT_ID || !API_KEY || !APP_ID) {
     throw new Error(
-      "Google Drive isn't configured — set VITE_GOOGLE_CLIENT_ID and VITE_GOOGLE_API_KEY in .env"
+      "Google Drive isn't configured — set VITE_GOOGLE_CLIENT_ID, VITE_GOOGLE_API_KEY, and VITE_GOOGLE_APP_ID in .env"
     );
   }
 }
@@ -220,6 +221,7 @@ async function pickDriveFile() {
       .enableFeature(window.google.picker.Feature.SUPPORT_DRIVES)
       .setOAuthToken(token)
       .setDeveloperKey(API_KEY)
+      .setAppId(APP_ID)
       .setCallback((data) => {
         if (data.action === window.google.picker.Action.PICKED) {
           resolve(data.docs[0]);
