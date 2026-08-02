@@ -29,6 +29,27 @@ function parseBool(value) {
   return v === "true" || v === "yes" || v === "y" || v === "1";
 }
 
+const FALSY_FLAG_VALUES = new Set(["no", "n", "false", "0", "none"]);
+const TRUTHY_FLAG_VALUES = new Set(["yes", "y", "true", "1"]);
+
+// IEP and Behavior Notes are free-text fields in this app, but many
+// school SIS exports have them as a bare Yes/No flag column instead of
+// real notes. Taking that literally means a cell reading "No" — a
+// non-empty string — gets stored as if it were real accommodation
+// text, and the UI flags every student with any non-empty iep field
+// as having one regardless of what the cell actually said. Detect the
+// flag-only case: "No" becomes no notes at all, "Yes" becomes a clear
+// placeholder prompting the teacher to fill in specifics, and any
+// other text is trusted as real, already-descriptive notes.
+function parseNotesCellValue(raw) {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return "";
+  const lower = trimmed.toLowerCase();
+  if (FALSY_FLAG_VALUES.has(lower)) return "";
+  if (TRUTHY_FLAG_VALUES.has(lower)) return "On file (imported as a Yes/No flag — add specific details).";
+  return trimmed;
+}
+
 function splitNameList(value) {
   return (value || "")
     .split(";")
@@ -87,8 +108,8 @@ export function parseRosterCsv(text) {
       if (col.elLevel !== -1) row.elLevel = (cells[col.elLevel] || "").trim();
       if (col.vision !== -1) row.vision = parseBool(cells[col.vision]);
       if (col.hearing !== -1) row.hearing = parseBool(cells[col.hearing]);
-      if (col.iep !== -1) row.iep = cells[col.iep] || "";
-      if (col.behaviorNotes !== -1) row.behaviorNotes = cells[col.behaviorNotes] || "";
+      if (col.iep !== -1) row.iep = parseNotesCellValue(cells[col.iep]);
+      if (col.behaviorNotes !== -1) row.behaviorNotes = parseNotesCellValue(cells[col.behaviorNotes]);
       if (col.friends !== -1) row.friendNames = splitNameList(cells[col.friends]);
       if (col.avoid !== -1) row.avoidNames = splitNameList(cells[col.avoid]);
       return row;
