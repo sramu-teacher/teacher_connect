@@ -10,7 +10,8 @@ const HEADER_ALIASES = {
   elLevel: ["el level", "ellevel", "proficiency", "proficiency level"],
   vision: ["vision"],
   hearing: ["hearing"],
-  iep: ["iep", "iep notes", "iep / 504 accommodations", "504", "accommodations"],
+  iep: ["iep", "has iep", "iep flag", "504"],
+  iepNotes: ["iep notes", "iep note", "iep / 504 accommodations", "accommodations"],
   behaviorNotes: ["behavior notes", "behavior", "behaviour notes", "behaviour"],
   friends: ["friends", "pairs well with"],
   avoid: ["avoid", "must not sit near", "avoid pairing"],
@@ -50,6 +51,33 @@ function parseNotesCellValue(raw) {
   return trimmed;
 }
 
+// IEP status is now its own checkbox (hasIep), separate from the notes
+// text — but CSVs can supply either an old-style single "IEP" column
+// (bare Yes/No, or real text if a school SIS export used a text-notes
+// column under that header) and/or a dedicated "IEP Notes" column. A
+// bare Yes/No in the flag column only sets the checkbox; real text in
+// either column sets the checkbox AND is trusted as real notes, with
+// "IEP Notes" taking priority when both are present.
+function parseIepFields(flagRaw, notesRaw) {
+  const flagTrimmed = (flagRaw || "").trim();
+  const flagLower = flagTrimmed.toLowerCase();
+  const notesTrimmed = (notesRaw || "").trim();
+
+  let hasIep = TRUTHY_FLAG_VALUES.has(flagLower);
+  let notes = "";
+
+  if (flagTrimmed && !FALSY_FLAG_VALUES.has(flagLower) && !TRUTHY_FLAG_VALUES.has(flagLower)) {
+    hasIep = true;
+    notes = flagTrimmed;
+  }
+  if (notesTrimmed) {
+    hasIep = true;
+    notes = notesTrimmed;
+  }
+
+  return { hasIep, notes };
+}
+
 function splitNameList(value) {
   return (value || "")
     .split(";")
@@ -78,6 +106,7 @@ export function parseRosterCsv(text) {
     vision: findColumnIndex(headerRow, HEADER_ALIASES.vision),
     hearing: findColumnIndex(headerRow, HEADER_ALIASES.hearing),
     iep: findColumnIndex(headerRow, HEADER_ALIASES.iep),
+    iepNotes: findColumnIndex(headerRow, HEADER_ALIASES.iepNotes),
     behaviorNotes: findColumnIndex(headerRow, HEADER_ALIASES.behaviorNotes),
     friends: findColumnIndex(headerRow, HEADER_ALIASES.friends),
     avoid: findColumnIndex(headerRow, HEADER_ALIASES.avoid),
@@ -108,7 +137,14 @@ export function parseRosterCsv(text) {
       if (col.elLevel !== -1) row.elLevel = (cells[col.elLevel] || "").trim();
       if (col.vision !== -1) row.vision = parseBool(cells[col.vision]);
       if (col.hearing !== -1) row.hearing = parseBool(cells[col.hearing]);
-      if (col.iep !== -1) row.iep = parseNotesCellValue(cells[col.iep]);
+      if (col.iep !== -1 || col.iepNotes !== -1) {
+        const { hasIep, notes } = parseIepFields(
+          col.iep !== -1 ? cells[col.iep] : "",
+          col.iepNotes !== -1 ? cells[col.iepNotes] : ""
+        );
+        row.hasIep = hasIep;
+        if (notes) row.iep = notes;
+      }
       if (col.behaviorNotes !== -1) row.behaviorNotes = parseNotesCellValue(cells[col.behaviorNotes]);
       if (col.friends !== -1) row.friendNames = splitNameList(cells[col.friends]);
       if (col.avoid !== -1) row.avoidNames = splitNameList(cells[col.avoid]);
@@ -121,7 +157,7 @@ export function parseRosterCsv(text) {
 
 const CSV_HEADER = [
   "Period", "Name", "Academic Level", "EL", "EL Level", "Vision", "Hearing",
-  "IEP", "Behavior Notes", "Friends", "Avoid",
+  "IEP", "IEP Notes", "Behavior Notes", "Friends", "Avoid",
 ];
 
 // Builds the full multi-period roster export: one row per student across
@@ -142,6 +178,7 @@ export function buildRosterCsv(periods, periodOrder) {
         s.elLevel || "",
         s.vision ? "true" : "false",
         s.hearing ? "true" : "false",
+        s.hasIep ? "true" : "false",
         s.iep || "",
         s.behaviorNotes || "",
         s.friends.map((id) => byId[id]?.name).filter(Boolean).join("; "),
