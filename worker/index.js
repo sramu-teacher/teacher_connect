@@ -7,20 +7,30 @@
 // to Claude directly. It also applies a basic per-IP daily cap, since the
 // app is public and multi-tenant (every teacher who signs in can hit this).
 
-const ALLOWED_ORIGIN = "https://sramu-teacher.github.io";
+const PRODUCTION_ORIGIN = "https://sramu-teacher.github.io";
+// Any localhost port is allowed too, so `npm run dev` can hit this Worker
+// during local testing without loosening access for anyone else — Vite
+// picks a different port whenever the previous one is taken.
+const LOCALHOST_ORIGIN_RE = /^http:\/\/localhost:\d+$/;
 const DAILY_LIMIT_PER_IP = 30;
 const MAX_INPUT_CHARS = 8000;
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
+function isAllowedOrigin(origin) {
+  return origin === PRODUCTION_ORIGIN || LOCALHOST_ORIGIN_RE.test(origin || "");
+}
 
-function json(data, status = 200) {
+function corsHeaders(origin) {
+  return {
+    "Access-Control-Allow-Origin": isAllowedOrigin(origin) ? origin : PRODUCTION_ORIGIN,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+}
+
+function json(data, status = 200, origin) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    headers: { "Content-Type": "application/json", ...corsHeaders(origin) },
   });
 }
 
@@ -34,30 +44,32 @@ async function checkRateLimit(env, ip) {
 
 export default {
   async fetch(request, env) {
+    const origin = request.headers.get("Origin");
+
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS_HEADERS });
+      return new Response(null, { headers: corsHeaders(origin) });
     }
     if (request.method !== "POST") {
-      return json({ error: "Method not allowed" }, 405);
+      return json({ error: "Method not allowed" }, 405, origin);
     }
 
     const ip = request.headers.get("cf-connecting-ip") || "unknown";
     const allowed = await checkRateLimit(env, ip);
     if (!allowed) {
-      return json({ error: "Daily limit reached for this feature — please try again tomorrow." }, 429);
+      return json({ error: "Daily limit reached for this feature — please try again tomorrow." }, 429, origin);
     }
 
     let body;
     try {
       body = await request.json();
     } catch {
-      return json({ error: "Invalid request body" }, 400);
+      return json({ error: "Invalid request body" }, 400, origin);
     }
 
     const text = (body?.text || "").trim();
-    if (!text) return json({ error: "No text provided" }, 400);
+    if (!text) return json({ error: "No text provided" }, 400, origin);
     if (text.length > MAX_INPUT_CHARS) {
-      return json({ error: `Text is too long to polish (max ${MAX_INPUT_CHARS} characters).` }, 400);
+      return json({ error: `Text is too long to polish (max ${MAX_INPUT_CHARS} characters).` }, 400, origin);
     }
 
     // effort: "low" — this is a short, well-scoped wording pass, not a
@@ -81,7 +93,7 @@ export default {
 
     if (!anthropicRes.ok) {
       const detail = await anthropicRes.text().catch(() => "");
-      return json({ error: `Claude API error (${anthropicRes.status})`, detail }, 502);
+      return json({ error: `Claude API error (${anthropicRes.status})`, detail }, 502, origin);
     }
 
     const data = await anthropicRes.json();
@@ -89,14 +101,14 @@ export default {
     // Opus 5 runs safety classifiers on every request; a decline is a
     // normal 200 response with stop_reason "refusal", not an HTTP error.
     if (data.stop_reason === "refusal") {
-      return json({ error: "The text couldn't be polished — please edit it manually." }, 422);
+      return json({ error: "The text couldn't be polished — please edit it manually." }, 422, origin);
     }
 
     const textBlock = (data.content || []).find((b) => b.type === "text");
     if (!textBlock) {
-      return json({ error: "No response text from Claude" }, 502);
+      return json({ error: "No response text from Claude" }, 502, origin);
     }
 
-    return json({ polished: textBlock.text.trim() });
+    return json({ polished: textBlock.text.trim() }, 200, origin);
   },
 };
