@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect, lazy, Suspense } from "react";
-import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag, LogOut } from "lucide-react";
+import { Plus, X, Upload, Download, CloudUpload, Wand2, AlertTriangle, Users, Ear, Eye, Languages, FileText, ChevronDown, ChevronUp, Trash2, RotateCcw, Grid3x3, Info, Check, Cloud, Loader2, StickyNote, Flag, LogOut, Bell } from "lucide-react";
 import { exportRosterSheetToDrive, pickRosterFileFromDrive, loadAppStateFromDrive, saveAppStateToDrive, requestInteractiveSignIn } from "./googleDrive";
 import { extractTextFromPdf } from "./pdf";
 import { loadPersistedState, savePersistedState, LEGACY_STORAGE_KEY, userStorageKey } from "./localPersistence";
@@ -45,6 +45,42 @@ const hasTextContent = (html) => Boolean(html && html.replace(/<[^>]*>/g, "").tr
 // so a student with real notes but no `hasIep` field yet (undefined,
 // not explicitly false) should keep showing the badge rather than
 // losing it the moment this ships.
+// Derives the notification list live from current state, rather than
+// persisting a separate queue — each item either resolves itself once
+// the underlying data changes (IEP notes get filled in, students get
+// seated) or it wouldn't be safe to "dismiss" independent of the data
+// anyway. `unseated` only fires once a period has an actual chart
+// (`hasGenerated`), so periods nobody's started seating yet don't nag.
+function computeNotifications(periods, periodOrder) {
+  const items = [];
+  for (const periodName of periodOrder) {
+    const p = periods[periodName];
+    if (!p) continue;
+    for (const s of p.students) {
+      if (s.hasIep && !hasTextContent(s.iep)) {
+        items.push({
+          id: `iep-${s.id}`,
+          periodName,
+          studentId: s.id,
+          message: `${s.name || "A student"} is marked as having an IEP but has no accommodation notes yet`,
+        });
+      }
+    }
+    if (p.hasGenerated) {
+      const unseatedCount = p.students.filter((s) => !Object.values(p.assignment).includes(s.id)).length;
+      if (unseatedCount > 0) {
+        items.push({
+          id: `unseated-${periodName}`,
+          periodName,
+          studentId: null,
+          message: `${unseatedCount} student${unseatedCount === 1 ? "" : "s"} not yet seated in ${periodName}`,
+        });
+      }
+    }
+  }
+  return items;
+}
+
 function migratePeriodStudents(periodState) {
   if (!periodState?.students) return periodState;
   return {
@@ -419,9 +455,11 @@ export default function SeatingChart({ user, onSignOut }) {
   const [driveBusy, setDriveBusy] = useState(null); // "save" | null
   const [saveMenuOpen, setSaveMenuOpen] = useState(false);
   const [showBackupPanel, setShowBackupPanel] = useState(false);
+  const [notifOpen, setNotifOpen] = useState(false);
   const fileInputRef = useRef(null);
   const rosterFileInputRef = useRef(null);
   const saveMenuRef = useRef(null);
+  const notifMenuRef = useRef(null);
 
   useEffect(() => {
     if (!saveMenuOpen) return;
@@ -431,6 +469,17 @@ export default function SeatingChart({ user, onSignOut }) {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [saveMenuOpen]);
+
+  useEffect(() => {
+    if (!notifOpen) return;
+    const handleClickOutside = (e) => {
+      if (notifMenuRef.current && !notifMenuRef.current.contains(e.target)) setNotifOpen(false);
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [notifOpen]);
+
+  const notifications = useMemo(() => computeNotifications(periods, PERIODS), [periods]);
 
   // Update the active period's slice immutably. Accepts an object patch or a fn(prevPeriod) => patch
   const updatePeriod = useCallback(
@@ -982,6 +1031,62 @@ export default function SeatingChart({ user, onSignOut }) {
             </h1>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <div ref={notifMenuRef} style={{ position: "relative", display: "flex" }}>
+              <button
+                onClick={() => setNotifOpen((v) => !v)}
+                className="sans"
+                style={{ ...btnGhost, position: "relative" }}
+                aria-label="Notifications"
+                title="Notifications"
+              >
+                <Bell size={14} />
+                {notifications.length > 0 && (
+                  <span
+                    className="sans"
+                    style={{
+                      position: "absolute", top: -5, right: -5, minWidth: 15, height: 15, padding: "0 3px",
+                      borderRadius: 8, background: T.clay, color: "#fff", fontSize: 9.5, fontWeight: 700,
+                      display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1,
+                    }}
+                  >
+                    {notifications.length}
+                  </span>
+                )}
+              </button>
+              {notifOpen && (
+                <div
+                  className="fade-in sans"
+                  style={{
+                    position: "absolute", top: "calc(100% + 6px)", right: 0, width: 300, maxHeight: 340, overflowY: "auto",
+                    background: T.paper, border: `1px solid ${T.line}`, borderRadius: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.1)", zIndex: 30,
+                  }}
+                >
+                  <div style={{ padding: "10px 14px", borderBottom: `1px solid ${T.line}`, fontSize: 12, fontWeight: 700, color: T.ink }}>
+                    Notifications
+                  </div>
+                  {notifications.length === 0 ? (
+                    <div style={{ padding: "16px 14px", fontSize: 12.5, color: "#8A8272" }}>You're all caught up.</div>
+                  ) : (
+                    notifications.map((n) => (
+                      <button
+                        key={n.id}
+                        onClick={() => {
+                          setActivePeriod(n.periodName);
+                          setExpandedStudentId(n.studentId);
+                          setNotifOpen(false);
+                        }}
+                        style={{
+                          display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 12.5,
+                          color: T.graphite, background: "none", border: "none", borderBottom: `1px solid ${T.line}`,
+                        }}
+                      >
+                        {n.message}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
             <div className="sans" style={{ display: "flex", alignItems: "center", gap: 8, marginRight: 4 }}>
               {user.picture ? (
                 <img
